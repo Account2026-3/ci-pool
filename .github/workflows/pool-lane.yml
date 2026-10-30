@@ -102,38 +102,78 @@ jobs:
           jq -e --argjson want '[]' 'type == "object" and ((keys | sort) == ($want | sort)) and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,100}$") and . != "." and . != "..")' <<<"$IN_MATRIX" >/dev/null || { echo "::error::matrix is not this job's {key: value}"; exit 1; }
           jq -e --argjson want '{}' 'type == "object" and ((keys | sort) == ($want | keys | sort)) and all(to_entries[]; (.value | type == "object") and ((.value | keys | sort) == ($want[.key] | sort)) and all(.value[]; type == "string" and length <= 4096))' <<<"$IN_NEEDS" >/dev/null || { echo "::error::needs is not exactly the outputs this job reads"; exit 1; }
           jq -e 'type == "object" and ((keys - ["event","ref","base_sha","base_ref","pr"]) | length == 0) and ((.event // "") | test("^[a-z_]{0,32}$")) and ((.ref // "") | test("^(refs/(heads|tags|pull)/[A-Za-z0-9._/-]{1,200})?$")) and ((.base_sha // "") | test("^([0-9a-f]{40})?$")) and ((.base_ref // "") | test("^[A-Za-z0-9._/-]{0,200}$")) and ((.pr // "") | tostring | test("^([1-9][0-9]{0,9})?$"))' <<<"$IN_IDENTITY" >/dev/null || { echo "::error::identity is not the parent's {event, ref, base_sha, base_ref, pr}"; exit 1; }
-      - name: A read-only token for the private code (the bridge's POST /pool-checkout)
+      - name: Check out the private code with the bridge's read-only token (POST /pool-checkout), retried with a fresh one
         id: pool-checkout
+        shell: bash
         env:
           IN_SHA: ${{ inputs.sha }}
+          IN_CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+          IN_REPO: com-nikatru/Nikatru_Private
           BRIDGE: https://gh-bridge.nikatru.workers.dev
+          TRUSTED: .pool-trusted
         run: |
-          set -euo pipefail
-          oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value)
-          echo "::add-mask::$oidc"
-          answer=$(curl -fsS --retry 3 -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout")
-          token=$(jq -r .token <<<"$answer")
-          [[ -n "$token" && "$token" != null ]] || { echo "::error::the bridge returned no token"; exit 1; }
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: ${{ inputs.checkout_sha }}
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Check out private main's step wrapper and composite actions
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: main
-          path: .pool-trusted
-          sparse-checkout: |
-            tooling/ci
-            .github/actions
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
+          set -uo pipefail
+          # The bridge's token can 404 a fetch until it propagates: each retry asks for a FRESH one (pool-checkout.ts POOL_MINTS_PER_ATTEMPT).
+          wait_s=(0 10 30 60)
+          url="https://github.com/$IN_REPO"
+          token=''
+          why=''
+          err="${RUNNER_TEMP:-/tmp}/pool-git.err"
+          mint() {
+            local oidc answer code
+            oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value) || { why='bridge: the OIDC token could not be minted'; return 1; }
+            [[ -n "$oidc" && "$oidc" != null ]] || { why='bridge: the OIDC answer held no token'; return 1; }
+            echo "::add-mask::$oidc"
+            answer=$(curl -sS --retry 3 -w '\n%{http_code}' -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout") || { why='bridge: POST /pool-checkout could not be reached'; return 1; }
+            code=${answer##*$'\n'}
+            answer=${answer%$'\n'*}
+            [[ "$code" == 200 ]] || { why="bridge: POST /pool-checkout answered HTTP $code ($(jq -r '.error // empty' <<<"$answer" 2>/dev/null | tr -cd '[:print:]' | head -c 160))"; return 1; }
+            token=$(jq -r '.token // empty' <<<"$answer")
+            [[ -n "$token" ]] || { why='bridge: the bridge returned no token'; return 1; }
+            echo "::add-mask::$token"
+          }
+          # The token reaches git through the environment, never argv or a config file: no credential outlives the step.
+          authed() {
+            local basic
+            basic=$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')
+            echo "::add-mask::$basic"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" git "$@" 2>"$err"
+          }
+          # A failed fetch, named by its class: git's own fetch lines say nothing of the private tree.
+          fetch_why() {
+            local e
+            e=$(grep -E '^(fatal|error|remote):' "$err" | tail -2 | tr '\n' ' ' | tr -cd '[:print:]' | head -c 200)
+            case "$e" in
+              *'not found'* | *' 404'*) why="checkout: $1 404s (Repository not found) — $e" ;;
+              *'expected'*'packfile'*) why="checkout: $1 ended before its packfile — $e" ;;
+              *promisor*) why="checkout: $1 could not reach its promisor remote — $e" ;;
+              *) why="checkout: $1 failed — $e" ;;
+            esac
+          }
+          attempt() {
+            mint || return 1
+            git init -q . && { git remote remove origin 2>/dev/null; git remote add origin "$url"; } || { why='checkout: the workspace could not be initialised'; return 1; }
+            authed fetch --no-tags --prune --no-recurse-submodules origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || { fetch_why 'the fetch of the private branches'; return 1; }
+            if ! git cat-file -e "$IN_CHECKOUT_SHA^{commit}" 2>/dev/null; then
+              authed fetch --no-tags --no-recurse-submodules origin "$IN_CHECKOUT_SHA" || { fetch_why "the fetch of checkout_sha $IN_CHECKOUT_SHA"; return 1; }
+            fi
+            git checkout -q --force --detach "$IN_CHECKOUT_SHA" 2>/dev/null || { why="checkout: checkout_sha $IN_CHECKOUT_SHA could not be checked out"; return 1; }
+            rm -rf "$TRUSTED" && git init -q "$TRUSTED" && git -C "$TRUSTED" remote add origin "$url" && git -C "$TRUSTED" sparse-checkout set tooling/ci .github/actions || { why="checkout: $TRUSTED could not be initialised"; return 1; }
+            authed -C "$TRUSTED" fetch --no-tags --depth 1 origin '+refs/heads/main:refs/remotes/origin/main' || { fetch_why "the fetch of private main into $TRUSTED"; return 1; }
+            git -C "$TRUSTED" checkout -q --force -B main refs/remotes/origin/main 2>/dev/null || { why="checkout: private main could not be checked out into $TRUSTED"; return 1; }
+          }
+          for n in "${!wait_s[@]}"; do
+            if (( n > 0 )); then
+              echo "::warning::pool checkout attempt $n of ${#wait_s[@]} failed ($why); retrying in ${wait_s[n]} s with a fresh bridge token"
+              sleep "${wait_s[n]}"
+            fi
+            if attempt; then
+              echo "pool checkout: the private code at $IN_CHECKOUT_SHA and private main's tooling, attempt $((n + 1)) of ${#wait_s[@]}"
+              exit 0
+            fi
+          done
+          echo "::error::POOL-INFRA $why (after ${#wait_s[@]} attempts, each with a fresh bridge token)"
+          exit 1
       - name: Keep private main's copies out of the checked-out tree
         run: printf '/.pool-trusted/\n' >> "$(git rev-parse --git-path info/exclude)"
       - name: Name the private commit (the shell prelude's identity, from the parent run)
@@ -196,38 +236,78 @@ jobs:
           jq -e --argjson want '[]' 'type == "object" and ((keys | sort) == ($want | sort)) and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,100}$") and . != "." and . != "..")' <<<"$IN_MATRIX" >/dev/null || { echo "::error::matrix is not this job's {key: value}"; exit 1; }
           jq -e --argjson want '{}' 'type == "object" and ((keys | sort) == ($want | keys | sort)) and all(to_entries[]; (.value | type == "object") and ((.value | keys | sort) == ($want[.key] | sort)) and all(.value[]; type == "string" and length <= 4096))' <<<"$IN_NEEDS" >/dev/null || { echo "::error::needs is not exactly the outputs this job reads"; exit 1; }
           jq -e 'type == "object" and ((keys - ["event","ref","base_sha","base_ref","pr"]) | length == 0) and ((.event // "") | test("^[a-z_]{0,32}$")) and ((.ref // "") | test("^(refs/(heads|tags|pull)/[A-Za-z0-9._/-]{1,200})?$")) and ((.base_sha // "") | test("^([0-9a-f]{40})?$")) and ((.base_ref // "") | test("^[A-Za-z0-9._/-]{0,200}$")) and ((.pr // "") | tostring | test("^([1-9][0-9]{0,9})?$"))' <<<"$IN_IDENTITY" >/dev/null || { echo "::error::identity is not the parent's {event, ref, base_sha, base_ref, pr}"; exit 1; }
-      - name: A read-only token for the private code (the bridge's POST /pool-checkout)
+      - name: Check out the private code with the bridge's read-only token (POST /pool-checkout), retried with a fresh one
         id: pool-checkout
+        shell: bash
         env:
           IN_SHA: ${{ inputs.sha }}
+          IN_CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+          IN_REPO: com-nikatru/Nikatru_Private
           BRIDGE: https://gh-bridge.nikatru.workers.dev
+          TRUSTED: .pool-trusted
         run: |
-          set -euo pipefail
-          oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value)
-          echo "::add-mask::$oidc"
-          answer=$(curl -fsS --retry 3 -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout")
-          token=$(jq -r .token <<<"$answer")
-          [[ -n "$token" && "$token" != null ]] || { echo "::error::the bridge returned no token"; exit 1; }
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: ${{ inputs.checkout_sha }}
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Check out private main's step wrapper and composite actions
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: main
-          path: .pool-trusted
-          sparse-checkout: |
-            tooling/ci
-            .github/actions
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
+          set -uo pipefail
+          # The bridge's token can 404 a fetch until it propagates: each retry asks for a FRESH one (pool-checkout.ts POOL_MINTS_PER_ATTEMPT).
+          wait_s=(0 10 30 60)
+          url="https://github.com/$IN_REPO"
+          token=''
+          why=''
+          err="${RUNNER_TEMP:-/tmp}/pool-git.err"
+          mint() {
+            local oidc answer code
+            oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value) || { why='bridge: the OIDC token could not be minted'; return 1; }
+            [[ -n "$oidc" && "$oidc" != null ]] || { why='bridge: the OIDC answer held no token'; return 1; }
+            echo "::add-mask::$oidc"
+            answer=$(curl -sS --retry 3 -w '\n%{http_code}' -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout") || { why='bridge: POST /pool-checkout could not be reached'; return 1; }
+            code=${answer##*$'\n'}
+            answer=${answer%$'\n'*}
+            [[ "$code" == 200 ]] || { why="bridge: POST /pool-checkout answered HTTP $code ($(jq -r '.error // empty' <<<"$answer" 2>/dev/null | tr -cd '[:print:]' | head -c 160))"; return 1; }
+            token=$(jq -r '.token // empty' <<<"$answer")
+            [[ -n "$token" ]] || { why='bridge: the bridge returned no token'; return 1; }
+            echo "::add-mask::$token"
+          }
+          # The token reaches git through the environment, never argv or a config file: no credential outlives the step.
+          authed() {
+            local basic
+            basic=$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')
+            echo "::add-mask::$basic"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" git "$@" 2>"$err"
+          }
+          # A failed fetch, named by its class: git's own fetch lines say nothing of the private tree.
+          fetch_why() {
+            local e
+            e=$(grep -E '^(fatal|error|remote):' "$err" | tail -2 | tr '\n' ' ' | tr -cd '[:print:]' | head -c 200)
+            case "$e" in
+              *'not found'* | *' 404'*) why="checkout: $1 404s (Repository not found) — $e" ;;
+              *'expected'*'packfile'*) why="checkout: $1 ended before its packfile — $e" ;;
+              *promisor*) why="checkout: $1 could not reach its promisor remote — $e" ;;
+              *) why="checkout: $1 failed — $e" ;;
+            esac
+          }
+          attempt() {
+            mint || return 1
+            git init -q . && { git remote remove origin 2>/dev/null; git remote add origin "$url"; } || { why='checkout: the workspace could not be initialised'; return 1; }
+            authed fetch --no-tags --prune --no-recurse-submodules origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || { fetch_why 'the fetch of the private branches'; return 1; }
+            if ! git cat-file -e "$IN_CHECKOUT_SHA^{commit}" 2>/dev/null; then
+              authed fetch --no-tags --no-recurse-submodules origin "$IN_CHECKOUT_SHA" || { fetch_why "the fetch of checkout_sha $IN_CHECKOUT_SHA"; return 1; }
+            fi
+            git checkout -q --force --detach "$IN_CHECKOUT_SHA" 2>/dev/null || { why="checkout: checkout_sha $IN_CHECKOUT_SHA could not be checked out"; return 1; }
+            rm -rf "$TRUSTED" && git init -q "$TRUSTED" && git -C "$TRUSTED" remote add origin "$url" && git -C "$TRUSTED" sparse-checkout set tooling/ci .github/actions || { why="checkout: $TRUSTED could not be initialised"; return 1; }
+            authed -C "$TRUSTED" fetch --no-tags --depth 1 origin '+refs/heads/main:refs/remotes/origin/main' || { fetch_why "the fetch of private main into $TRUSTED"; return 1; }
+            git -C "$TRUSTED" checkout -q --force -B main refs/remotes/origin/main 2>/dev/null || { why="checkout: private main could not be checked out into $TRUSTED"; return 1; }
+          }
+          for n in "${!wait_s[@]}"; do
+            if (( n > 0 )); then
+              echo "::warning::pool checkout attempt $n of ${#wait_s[@]} failed ($why); retrying in ${wait_s[n]} s with a fresh bridge token"
+              sleep "${wait_s[n]}"
+            fi
+            if attempt; then
+              echo "pool checkout: the private code at $IN_CHECKOUT_SHA and private main's tooling, attempt $((n + 1)) of ${#wait_s[@]}"
+              exit 0
+            fi
+          done
+          echo "::error::POOL-INFRA $why (after ${#wait_s[@]} attempts, each with a fresh bridge token)"
+          exit 1
       - name: Keep private main's copies out of the checked-out tree
         run: printf '/.pool-trusted/\n' >> "$(git rev-parse --git-path info/exclude)"
       - name: Name the private commit (the shell prelude's identity, from the parent run)
@@ -366,38 +446,78 @@ jobs:
           jq -e --argjson want '[]' 'type == "object" and ((keys | sort) == ($want | sort)) and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,100}$") and . != "." and . != "..")' <<<"$IN_MATRIX" >/dev/null || { echo "::error::matrix is not this job's {key: value}"; exit 1; }
           jq -e --argjson want '{}' 'type == "object" and ((keys | sort) == ($want | keys | sort)) and all(to_entries[]; (.value | type == "object") and ((.value | keys | sort) == ($want[.key] | sort)) and all(.value[]; type == "string" and length <= 4096))' <<<"$IN_NEEDS" >/dev/null || { echo "::error::needs is not exactly the outputs this job reads"; exit 1; }
           jq -e 'type == "object" and ((keys - ["event","ref","base_sha","base_ref","pr"]) | length == 0) and ((.event // "") | test("^[a-z_]{0,32}$")) and ((.ref // "") | test("^(refs/(heads|tags|pull)/[A-Za-z0-9._/-]{1,200})?$")) and ((.base_sha // "") | test("^([0-9a-f]{40})?$")) and ((.base_ref // "") | test("^[A-Za-z0-9._/-]{0,200}$")) and ((.pr // "") | tostring | test("^([1-9][0-9]{0,9})?$"))' <<<"$IN_IDENTITY" >/dev/null || { echo "::error::identity is not the parent's {event, ref, base_sha, base_ref, pr}"; exit 1; }
-      - name: A read-only token for the private code (the bridge's POST /pool-checkout)
+      - name: Check out the private code with the bridge's read-only token (POST /pool-checkout), retried with a fresh one
         id: pool-checkout
+        shell: bash
         env:
           IN_SHA: ${{ inputs.sha }}
+          IN_CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+          IN_REPO: com-nikatru/Nikatru_Private
           BRIDGE: https://gh-bridge.nikatru.workers.dev
+          TRUSTED: .pool-trusted
         run: |
-          set -euo pipefail
-          oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value)
-          echo "::add-mask::$oidc"
-          answer=$(curl -fsS --retry 3 -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout")
-          token=$(jq -r .token <<<"$answer")
-          [[ -n "$token" && "$token" != null ]] || { echo "::error::the bridge returned no token"; exit 1; }
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: ${{ inputs.checkout_sha }}
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Check out private main's step wrapper and composite actions
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: main
-          path: .pool-trusted
-          sparse-checkout: |
-            tooling/ci
-            .github/actions
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
+          set -uo pipefail
+          # The bridge's token can 404 a fetch until it propagates: each retry asks for a FRESH one (pool-checkout.ts POOL_MINTS_PER_ATTEMPT).
+          wait_s=(0 10 30 60)
+          url="https://github.com/$IN_REPO"
+          token=''
+          why=''
+          err="${RUNNER_TEMP:-/tmp}/pool-git.err"
+          mint() {
+            local oidc answer code
+            oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value) || { why='bridge: the OIDC token could not be minted'; return 1; }
+            [[ -n "$oidc" && "$oidc" != null ]] || { why='bridge: the OIDC answer held no token'; return 1; }
+            echo "::add-mask::$oidc"
+            answer=$(curl -sS --retry 3 -w '\n%{http_code}' -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout") || { why='bridge: POST /pool-checkout could not be reached'; return 1; }
+            code=${answer##*$'\n'}
+            answer=${answer%$'\n'*}
+            [[ "$code" == 200 ]] || { why="bridge: POST /pool-checkout answered HTTP $code ($(jq -r '.error // empty' <<<"$answer" 2>/dev/null | tr -cd '[:print:]' | head -c 160))"; return 1; }
+            token=$(jq -r '.token // empty' <<<"$answer")
+            [[ -n "$token" ]] || { why='bridge: the bridge returned no token'; return 1; }
+            echo "::add-mask::$token"
+          }
+          # The token reaches git through the environment, never argv or a config file: no credential outlives the step.
+          authed() {
+            local basic
+            basic=$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')
+            echo "::add-mask::$basic"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" git "$@" 2>"$err"
+          }
+          # A failed fetch, named by its class: git's own fetch lines say nothing of the private tree.
+          fetch_why() {
+            local e
+            e=$(grep -E '^(fatal|error|remote):' "$err" | tail -2 | tr '\n' ' ' | tr -cd '[:print:]' | head -c 200)
+            case "$e" in
+              *'not found'* | *' 404'*) why="checkout: $1 404s (Repository not found) — $e" ;;
+              *'expected'*'packfile'*) why="checkout: $1 ended before its packfile — $e" ;;
+              *promisor*) why="checkout: $1 could not reach its promisor remote — $e" ;;
+              *) why="checkout: $1 failed — $e" ;;
+            esac
+          }
+          attempt() {
+            mint || return 1
+            git init -q . && { git remote remove origin 2>/dev/null; git remote add origin "$url"; } || { why='checkout: the workspace could not be initialised'; return 1; }
+            authed fetch --no-tags --prune --no-recurse-submodules origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || { fetch_why 'the fetch of the private branches'; return 1; }
+            if ! git cat-file -e "$IN_CHECKOUT_SHA^{commit}" 2>/dev/null; then
+              authed fetch --no-tags --no-recurse-submodules origin "$IN_CHECKOUT_SHA" || { fetch_why "the fetch of checkout_sha $IN_CHECKOUT_SHA"; return 1; }
+            fi
+            git checkout -q --force --detach "$IN_CHECKOUT_SHA" 2>/dev/null || { why="checkout: checkout_sha $IN_CHECKOUT_SHA could not be checked out"; return 1; }
+            rm -rf "$TRUSTED" && git init -q "$TRUSTED" && git -C "$TRUSTED" remote add origin "$url" && git -C "$TRUSTED" sparse-checkout set tooling/ci .github/actions || { why="checkout: $TRUSTED could not be initialised"; return 1; }
+            authed -C "$TRUSTED" fetch --no-tags --depth 1 origin '+refs/heads/main:refs/remotes/origin/main' || { fetch_why "the fetch of private main into $TRUSTED"; return 1; }
+            git -C "$TRUSTED" checkout -q --force -B main refs/remotes/origin/main 2>/dev/null || { why="checkout: private main could not be checked out into $TRUSTED"; return 1; }
+          }
+          for n in "${!wait_s[@]}"; do
+            if (( n > 0 )); then
+              echo "::warning::pool checkout attempt $n of ${#wait_s[@]} failed ($why); retrying in ${wait_s[n]} s with a fresh bridge token"
+              sleep "${wait_s[n]}"
+            fi
+            if attempt; then
+              echo "pool checkout: the private code at $IN_CHECKOUT_SHA and private main's tooling, attempt $((n + 1)) of ${#wait_s[@]}"
+              exit 0
+            fi
+          done
+          echo "::error::POOL-INFRA $why (after ${#wait_s[@]} attempts, each with a fresh bridge token)"
+          exit 1
       - name: Keep private main's copies out of the checked-out tree
         run: printf '/.pool-trusted/\n' >> "$(git rev-parse --git-path info/exclude)"
       - name: Name the private commit (the shell prelude's identity, from the parent run)
@@ -640,38 +760,78 @@ jobs:
           jq -e --argjson want '[]' 'type == "object" and ((keys | sort) == ($want | sort)) and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,100}$") and . != "." and . != "..")' <<<"$IN_MATRIX" >/dev/null || { echo "::error::matrix is not this job's {key: value}"; exit 1; }
           jq -e --argjson want '{}' 'type == "object" and ((keys | sort) == ($want | keys | sort)) and all(to_entries[]; (.value | type == "object") and ((.value | keys | sort) == ($want[.key] | sort)) and all(.value[]; type == "string" and length <= 4096))' <<<"$IN_NEEDS" >/dev/null || { echo "::error::needs is not exactly the outputs this job reads"; exit 1; }
           jq -e 'type == "object" and ((keys - ["event","ref","base_sha","base_ref","pr"]) | length == 0) and ((.event // "") | test("^[a-z_]{0,32}$")) and ((.ref // "") | test("^(refs/(heads|tags|pull)/[A-Za-z0-9._/-]{1,200})?$")) and ((.base_sha // "") | test("^([0-9a-f]{40})?$")) and ((.base_ref // "") | test("^[A-Za-z0-9._/-]{0,200}$")) and ((.pr // "") | tostring | test("^([1-9][0-9]{0,9})?$"))' <<<"$IN_IDENTITY" >/dev/null || { echo "::error::identity is not the parent's {event, ref, base_sha, base_ref, pr}"; exit 1; }
-      - name: A read-only token for the private code (the bridge's POST /pool-checkout)
+      - name: Check out the private code with the bridge's read-only token (POST /pool-checkout), retried with a fresh one
         id: pool-checkout
+        shell: bash
         env:
           IN_SHA: ${{ inputs.sha }}
+          IN_CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+          IN_REPO: com-nikatru/Nikatru_Private
           BRIDGE: https://gh-bridge.nikatru.workers.dev
+          TRUSTED: .pool-trusted
         run: |
-          set -euo pipefail
-          oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value)
-          echo "::add-mask::$oidc"
-          answer=$(curl -fsS --retry 3 -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout")
-          token=$(jq -r .token <<<"$answer")
-          [[ -n "$token" && "$token" != null ]] || { echo "::error::the bridge returned no token"; exit 1; }
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: ${{ inputs.checkout_sha }}
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Check out private main's step wrapper and composite actions
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: main
-          path: .pool-trusted
-          sparse-checkout: |
-            tooling/ci
-            .github/actions
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
+          set -uo pipefail
+          # The bridge's token can 404 a fetch until it propagates: each retry asks for a FRESH one (pool-checkout.ts POOL_MINTS_PER_ATTEMPT).
+          wait_s=(0 10 30 60)
+          url="https://github.com/$IN_REPO"
+          token=''
+          why=''
+          err="${RUNNER_TEMP:-/tmp}/pool-git.err"
+          mint() {
+            local oidc answer code
+            oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value) || { why='bridge: the OIDC token could not be minted'; return 1; }
+            [[ -n "$oidc" && "$oidc" != null ]] || { why='bridge: the OIDC answer held no token'; return 1; }
+            echo "::add-mask::$oidc"
+            answer=$(curl -sS --retry 3 -w '\n%{http_code}' -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout") || { why='bridge: POST /pool-checkout could not be reached'; return 1; }
+            code=${answer##*$'\n'}
+            answer=${answer%$'\n'*}
+            [[ "$code" == 200 ]] || { why="bridge: POST /pool-checkout answered HTTP $code ($(jq -r '.error // empty' <<<"$answer" 2>/dev/null | tr -cd '[:print:]' | head -c 160))"; return 1; }
+            token=$(jq -r '.token // empty' <<<"$answer")
+            [[ -n "$token" ]] || { why='bridge: the bridge returned no token'; return 1; }
+            echo "::add-mask::$token"
+          }
+          # The token reaches git through the environment, never argv or a config file: no credential outlives the step.
+          authed() {
+            local basic
+            basic=$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')
+            echo "::add-mask::$basic"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" git "$@" 2>"$err"
+          }
+          # A failed fetch, named by its class: git's own fetch lines say nothing of the private tree.
+          fetch_why() {
+            local e
+            e=$(grep -E '^(fatal|error|remote):' "$err" | tail -2 | tr '\n' ' ' | tr -cd '[:print:]' | head -c 200)
+            case "$e" in
+              *'not found'* | *' 404'*) why="checkout: $1 404s (Repository not found) — $e" ;;
+              *'expected'*'packfile'*) why="checkout: $1 ended before its packfile — $e" ;;
+              *promisor*) why="checkout: $1 could not reach its promisor remote — $e" ;;
+              *) why="checkout: $1 failed — $e" ;;
+            esac
+          }
+          attempt() {
+            mint || return 1
+            git init -q . && { git remote remove origin 2>/dev/null; git remote add origin "$url"; } || { why='checkout: the workspace could not be initialised'; return 1; }
+            authed fetch --no-tags --prune --no-recurse-submodules origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || { fetch_why 'the fetch of the private branches'; return 1; }
+            if ! git cat-file -e "$IN_CHECKOUT_SHA^{commit}" 2>/dev/null; then
+              authed fetch --no-tags --no-recurse-submodules origin "$IN_CHECKOUT_SHA" || { fetch_why "the fetch of checkout_sha $IN_CHECKOUT_SHA"; return 1; }
+            fi
+            git checkout -q --force --detach "$IN_CHECKOUT_SHA" 2>/dev/null || { why="checkout: checkout_sha $IN_CHECKOUT_SHA could not be checked out"; return 1; }
+            rm -rf "$TRUSTED" && git init -q "$TRUSTED" && git -C "$TRUSTED" remote add origin "$url" && git -C "$TRUSTED" sparse-checkout set tooling/ci .github/actions || { why="checkout: $TRUSTED could not be initialised"; return 1; }
+            authed -C "$TRUSTED" fetch --no-tags --depth 1 origin '+refs/heads/main:refs/remotes/origin/main' || { fetch_why "the fetch of private main into $TRUSTED"; return 1; }
+            git -C "$TRUSTED" checkout -q --force -B main refs/remotes/origin/main 2>/dev/null || { why="checkout: private main could not be checked out into $TRUSTED"; return 1; }
+          }
+          for n in "${!wait_s[@]}"; do
+            if (( n > 0 )); then
+              echo "::warning::pool checkout attempt $n of ${#wait_s[@]} failed ($why); retrying in ${wait_s[n]} s with a fresh bridge token"
+              sleep "${wait_s[n]}"
+            fi
+            if attempt; then
+              echo "pool checkout: the private code at $IN_CHECKOUT_SHA and private main's tooling, attempt $((n + 1)) of ${#wait_s[@]}"
+              exit 0
+            fi
+          done
+          echo "::error::POOL-INFRA $why (after ${#wait_s[@]} attempts, each with a fresh bridge token)"
+          exit 1
       - name: Keep private main's copies out of the checked-out tree
         run: printf '/.pool-trusted/\n' >> "$(git rev-parse --git-path info/exclude)"
       - name: Name the private commit (the shell prelude's identity, from the parent run)
@@ -955,38 +1115,78 @@ jobs:
           jq -e --argjson want '[]' 'type == "object" and ((keys | sort) == ($want | sort)) and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,100}$") and . != "." and . != "..")' <<<"$IN_MATRIX" >/dev/null || { echo "::error::matrix is not this job's {key: value}"; exit 1; }
           jq -e --argjson want '{}' 'type == "object" and ((keys | sort) == ($want | keys | sort)) and all(to_entries[]; (.value | type == "object") and ((.value | keys | sort) == ($want[.key] | sort)) and all(.value[]; type == "string" and length <= 4096))' <<<"$IN_NEEDS" >/dev/null || { echo "::error::needs is not exactly the outputs this job reads"; exit 1; }
           jq -e 'type == "object" and ((keys - ["event","ref","base_sha","base_ref","pr"]) | length == 0) and ((.event // "") | test("^[a-z_]{0,32}$")) and ((.ref // "") | test("^(refs/(heads|tags|pull)/[A-Za-z0-9._/-]{1,200})?$")) and ((.base_sha // "") | test("^([0-9a-f]{40})?$")) and ((.base_ref // "") | test("^[A-Za-z0-9._/-]{0,200}$")) and ((.pr // "") | tostring | test("^([1-9][0-9]{0,9})?$"))' <<<"$IN_IDENTITY" >/dev/null || { echo "::error::identity is not the parent's {event, ref, base_sha, base_ref, pr}"; exit 1; }
-      - name: A read-only token for the private code (the bridge's POST /pool-checkout)
+      - name: Check out the private code with the bridge's read-only token (POST /pool-checkout), retried with a fresh one
         id: pool-checkout
+        shell: bash
         env:
           IN_SHA: ${{ inputs.sha }}
+          IN_CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+          IN_REPO: com-nikatru/Nikatru_Private
           BRIDGE: https://gh-bridge.nikatru.workers.dev
+          TRUSTED: .pool-trusted
         run: |
-          set -euo pipefail
-          oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value)
-          echo "::add-mask::$oidc"
-          answer=$(curl -fsS --retry 3 -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout")
-          token=$(jq -r .token <<<"$answer")
-          [[ -n "$token" && "$token" != null ]] || { echo "::error::the bridge returned no token"; exit 1; }
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: ${{ inputs.checkout_sha }}
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Check out private main's step wrapper and composite actions
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: main
-          path: .pool-trusted
-          sparse-checkout: |
-            tooling/ci
-            .github/actions
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
+          set -uo pipefail
+          # The bridge's token can 404 a fetch until it propagates: each retry asks for a FRESH one (pool-checkout.ts POOL_MINTS_PER_ATTEMPT).
+          wait_s=(0 10 30 60)
+          url="https://github.com/$IN_REPO"
+          token=''
+          why=''
+          err="${RUNNER_TEMP:-/tmp}/pool-git.err"
+          mint() {
+            local oidc answer code
+            oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value) || { why='bridge: the OIDC token could not be minted'; return 1; }
+            [[ -n "$oidc" && "$oidc" != null ]] || { why='bridge: the OIDC answer held no token'; return 1; }
+            echo "::add-mask::$oidc"
+            answer=$(curl -sS --retry 3 -w '\n%{http_code}' -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout") || { why='bridge: POST /pool-checkout could not be reached'; return 1; }
+            code=${answer##*$'\n'}
+            answer=${answer%$'\n'*}
+            [[ "$code" == 200 ]] || { why="bridge: POST /pool-checkout answered HTTP $code ($(jq -r '.error // empty' <<<"$answer" 2>/dev/null | tr -cd '[:print:]' | head -c 160))"; return 1; }
+            token=$(jq -r '.token // empty' <<<"$answer")
+            [[ -n "$token" ]] || { why='bridge: the bridge returned no token'; return 1; }
+            echo "::add-mask::$token"
+          }
+          # The token reaches git through the environment, never argv or a config file: no credential outlives the step.
+          authed() {
+            local basic
+            basic=$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')
+            echo "::add-mask::$basic"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" git "$@" 2>"$err"
+          }
+          # A failed fetch, named by its class: git's own fetch lines say nothing of the private tree.
+          fetch_why() {
+            local e
+            e=$(grep -E '^(fatal|error|remote):' "$err" | tail -2 | tr '\n' ' ' | tr -cd '[:print:]' | head -c 200)
+            case "$e" in
+              *'not found'* | *' 404'*) why="checkout: $1 404s (Repository not found) — $e" ;;
+              *'expected'*'packfile'*) why="checkout: $1 ended before its packfile — $e" ;;
+              *promisor*) why="checkout: $1 could not reach its promisor remote — $e" ;;
+              *) why="checkout: $1 failed — $e" ;;
+            esac
+          }
+          attempt() {
+            mint || return 1
+            git init -q . && { git remote remove origin 2>/dev/null; git remote add origin "$url"; } || { why='checkout: the workspace could not be initialised'; return 1; }
+            authed fetch --no-tags --prune --no-recurse-submodules origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || { fetch_why 'the fetch of the private branches'; return 1; }
+            if ! git cat-file -e "$IN_CHECKOUT_SHA^{commit}" 2>/dev/null; then
+              authed fetch --no-tags --no-recurse-submodules origin "$IN_CHECKOUT_SHA" || { fetch_why "the fetch of checkout_sha $IN_CHECKOUT_SHA"; return 1; }
+            fi
+            git checkout -q --force --detach "$IN_CHECKOUT_SHA" 2>/dev/null || { why="checkout: checkout_sha $IN_CHECKOUT_SHA could not be checked out"; return 1; }
+            rm -rf "$TRUSTED" && git init -q "$TRUSTED" && git -C "$TRUSTED" remote add origin "$url" && git -C "$TRUSTED" sparse-checkout set tooling/ci .github/actions || { why="checkout: $TRUSTED could not be initialised"; return 1; }
+            authed -C "$TRUSTED" fetch --no-tags --depth 1 origin '+refs/heads/main:refs/remotes/origin/main' || { fetch_why "the fetch of private main into $TRUSTED"; return 1; }
+            git -C "$TRUSTED" checkout -q --force -B main refs/remotes/origin/main 2>/dev/null || { why="checkout: private main could not be checked out into $TRUSTED"; return 1; }
+          }
+          for n in "${!wait_s[@]}"; do
+            if (( n > 0 )); then
+              echo "::warning::pool checkout attempt $n of ${#wait_s[@]} failed ($why); retrying in ${wait_s[n]} s with a fresh bridge token"
+              sleep "${wait_s[n]}"
+            fi
+            if attempt; then
+              echo "pool checkout: the private code at $IN_CHECKOUT_SHA and private main's tooling, attempt $((n + 1)) of ${#wait_s[@]}"
+              exit 0
+            fi
+          done
+          echo "::error::POOL-INFRA $why (after ${#wait_s[@]} attempts, each with a fresh bridge token)"
+          exit 1
       - name: Keep private main's copies out of the checked-out tree
         run: printf '/.pool-trusted/\n' >> "$(git rev-parse --git-path info/exclude)"
       - name: Name the private commit (the shell prelude's identity, from the parent run)
@@ -1160,38 +1360,78 @@ jobs:
           jq -e --argjson want '[]' 'type == "object" and ((keys | sort) == ($want | sort)) and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,100}$") and . != "." and . != "..")' <<<"$IN_MATRIX" >/dev/null || { echo "::error::matrix is not this job's {key: value}"; exit 1; }
           jq -e --argjson want '{}' 'type == "object" and ((keys | sort) == ($want | keys | sort)) and all(to_entries[]; (.value | type == "object") and ((.value | keys | sort) == ($want[.key] | sort)) and all(.value[]; type == "string" and length <= 4096))' <<<"$IN_NEEDS" >/dev/null || { echo "::error::needs is not exactly the outputs this job reads"; exit 1; }
           jq -e 'type == "object" and ((keys - ["event","ref","base_sha","base_ref","pr"]) | length == 0) and ((.event // "") | test("^[a-z_]{0,32}$")) and ((.ref // "") | test("^(refs/(heads|tags|pull)/[A-Za-z0-9._/-]{1,200})?$")) and ((.base_sha // "") | test("^([0-9a-f]{40})?$")) and ((.base_ref // "") | test("^[A-Za-z0-9._/-]{0,200}$")) and ((.pr // "") | tostring | test("^([1-9][0-9]{0,9})?$"))' <<<"$IN_IDENTITY" >/dev/null || { echo "::error::identity is not the parent's {event, ref, base_sha, base_ref, pr}"; exit 1; }
-      - name: A read-only token for the private code (the bridge's POST /pool-checkout)
+      - name: Check out the private code with the bridge's read-only token (POST /pool-checkout), retried with a fresh one
         id: pool-checkout
+        shell: bash
         env:
           IN_SHA: ${{ inputs.sha }}
+          IN_CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+          IN_REPO: com-nikatru/Nikatru_Private
           BRIDGE: https://gh-bridge.nikatru.workers.dev
+          TRUSTED: .pool-trusted
         run: |
-          set -euo pipefail
-          oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value)
-          echo "::add-mask::$oidc"
-          answer=$(curl -fsS --retry 3 -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout")
-          token=$(jq -r .token <<<"$answer")
-          [[ -n "$token" && "$token" != null ]] || { echo "::error::the bridge returned no token"; exit 1; }
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: ${{ inputs.checkout_sha }}
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Check out private main's step wrapper and composite actions
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: main
-          path: .pool-trusted
-          sparse-checkout: |
-            tooling/ci
-            .github/actions
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
+          set -uo pipefail
+          # The bridge's token can 404 a fetch until it propagates: each retry asks for a FRESH one (pool-checkout.ts POOL_MINTS_PER_ATTEMPT).
+          wait_s=(0 10 30 60)
+          url="https://github.com/$IN_REPO"
+          token=''
+          why=''
+          err="${RUNNER_TEMP:-/tmp}/pool-git.err"
+          mint() {
+            local oidc answer code
+            oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value) || { why='bridge: the OIDC token could not be minted'; return 1; }
+            [[ -n "$oidc" && "$oidc" != null ]] || { why='bridge: the OIDC answer held no token'; return 1; }
+            echo "::add-mask::$oidc"
+            answer=$(curl -sS --retry 3 -w '\n%{http_code}' -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout") || { why='bridge: POST /pool-checkout could not be reached'; return 1; }
+            code=${answer##*$'\n'}
+            answer=${answer%$'\n'*}
+            [[ "$code" == 200 ]] || { why="bridge: POST /pool-checkout answered HTTP $code ($(jq -r '.error // empty' <<<"$answer" 2>/dev/null | tr -cd '[:print:]' | head -c 160))"; return 1; }
+            token=$(jq -r '.token // empty' <<<"$answer")
+            [[ -n "$token" ]] || { why='bridge: the bridge returned no token'; return 1; }
+            echo "::add-mask::$token"
+          }
+          # The token reaches git through the environment, never argv or a config file: no credential outlives the step.
+          authed() {
+            local basic
+            basic=$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')
+            echo "::add-mask::$basic"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" git "$@" 2>"$err"
+          }
+          # A failed fetch, named by its class: git's own fetch lines say nothing of the private tree.
+          fetch_why() {
+            local e
+            e=$(grep -E '^(fatal|error|remote):' "$err" | tail -2 | tr '\n' ' ' | tr -cd '[:print:]' | head -c 200)
+            case "$e" in
+              *'not found'* | *' 404'*) why="checkout: $1 404s (Repository not found) — $e" ;;
+              *'expected'*'packfile'*) why="checkout: $1 ended before its packfile — $e" ;;
+              *promisor*) why="checkout: $1 could not reach its promisor remote — $e" ;;
+              *) why="checkout: $1 failed — $e" ;;
+            esac
+          }
+          attempt() {
+            mint || return 1
+            git init -q . && { git remote remove origin 2>/dev/null; git remote add origin "$url"; } || { why='checkout: the workspace could not be initialised'; return 1; }
+            authed fetch --no-tags --prune --no-recurse-submodules origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || { fetch_why 'the fetch of the private branches'; return 1; }
+            if ! git cat-file -e "$IN_CHECKOUT_SHA^{commit}" 2>/dev/null; then
+              authed fetch --no-tags --no-recurse-submodules origin "$IN_CHECKOUT_SHA" || { fetch_why "the fetch of checkout_sha $IN_CHECKOUT_SHA"; return 1; }
+            fi
+            git checkout -q --force --detach "$IN_CHECKOUT_SHA" 2>/dev/null || { why="checkout: checkout_sha $IN_CHECKOUT_SHA could not be checked out"; return 1; }
+            rm -rf "$TRUSTED" && git init -q "$TRUSTED" && git -C "$TRUSTED" remote add origin "$url" && git -C "$TRUSTED" sparse-checkout set tooling/ci .github/actions || { why="checkout: $TRUSTED could not be initialised"; return 1; }
+            authed -C "$TRUSTED" fetch --no-tags --depth 1 origin '+refs/heads/main:refs/remotes/origin/main' || { fetch_why "the fetch of private main into $TRUSTED"; return 1; }
+            git -C "$TRUSTED" checkout -q --force -B main refs/remotes/origin/main 2>/dev/null || { why="checkout: private main could not be checked out into $TRUSTED"; return 1; }
+          }
+          for n in "${!wait_s[@]}"; do
+            if (( n > 0 )); then
+              echo "::warning::pool checkout attempt $n of ${#wait_s[@]} failed ($why); retrying in ${wait_s[n]} s with a fresh bridge token"
+              sleep "${wait_s[n]}"
+            fi
+            if attempt; then
+              echo "pool checkout: the private code at $IN_CHECKOUT_SHA and private main's tooling, attempt $((n + 1)) of ${#wait_s[@]}"
+              exit 0
+            fi
+          done
+          echo "::error::POOL-INFRA $why (after ${#wait_s[@]} attempts, each with a fresh bridge token)"
+          exit 1
       - name: Keep private main's copies out of the checked-out tree
         run: printf '/.pool-trusted/\n' >> "$(git rev-parse --git-path info/exclude)"
       - name: Name the private commit (the shell prelude's identity, from the parent run)
@@ -1695,38 +1935,78 @@ jobs:
           jq -e --argjson want '["part"]' 'type == "object" and ((keys | sort) == ($want | sort)) and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,100}$") and . != "." and . != "..")' <<<"$IN_MATRIX" >/dev/null || { echo "::error::matrix is not this job's {key: value}"; exit 1; }
           jq -e --argjson want '{}' 'type == "object" and ((keys | sort) == ($want | keys | sort)) and all(to_entries[]; (.value | type == "object") and ((.value | keys | sort) == ($want[.key] | sort)) and all(.value[]; type == "string" and length <= 4096))' <<<"$IN_NEEDS" >/dev/null || { echo "::error::needs is not exactly the outputs this job reads"; exit 1; }
           jq -e 'type == "object" and ((keys - ["event","ref","base_sha","base_ref","pr"]) | length == 0) and ((.event // "") | test("^[a-z_]{0,32}$")) and ((.ref // "") | test("^(refs/(heads|tags|pull)/[A-Za-z0-9._/-]{1,200})?$")) and ((.base_sha // "") | test("^([0-9a-f]{40})?$")) and ((.base_ref // "") | test("^[A-Za-z0-9._/-]{0,200}$")) and ((.pr // "") | tostring | test("^([1-9][0-9]{0,9})?$"))' <<<"$IN_IDENTITY" >/dev/null || { echo "::error::identity is not the parent's {event, ref, base_sha, base_ref, pr}"; exit 1; }
-      - name: A read-only token for the private code (the bridge's POST /pool-checkout)
+      - name: Check out the private code with the bridge's read-only token (POST /pool-checkout), retried with a fresh one
         id: pool-checkout
+        shell: bash
         env:
           IN_SHA: ${{ inputs.sha }}
+          IN_CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+          IN_REPO: com-nikatru/Nikatru_Private
           BRIDGE: https://gh-bridge.nikatru.workers.dev
+          TRUSTED: .pool-trusted
         run: |
-          set -euo pipefail
-          oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value)
-          echo "::add-mask::$oidc"
-          answer=$(curl -fsS --retry 3 -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout")
-          token=$(jq -r .token <<<"$answer")
-          [[ -n "$token" && "$token" != null ]] || { echo "::error::the bridge returned no token"; exit 1; }
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: ${{ inputs.checkout_sha }}
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Check out private main's step wrapper and composite actions
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: main
-          path: .pool-trusted
-          sparse-checkout: |
-            tooling/ci
-            .github/actions
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
+          set -uo pipefail
+          # The bridge's token can 404 a fetch until it propagates: each retry asks for a FRESH one (pool-checkout.ts POOL_MINTS_PER_ATTEMPT).
+          wait_s=(0 10 30 60)
+          url="https://github.com/$IN_REPO"
+          token=''
+          why=''
+          err="${RUNNER_TEMP:-/tmp}/pool-git.err"
+          mint() {
+            local oidc answer code
+            oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value) || { why='bridge: the OIDC token could not be minted'; return 1; }
+            [[ -n "$oidc" && "$oidc" != null ]] || { why='bridge: the OIDC answer held no token'; return 1; }
+            echo "::add-mask::$oidc"
+            answer=$(curl -sS --retry 3 -w '\n%{http_code}' -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout") || { why='bridge: POST /pool-checkout could not be reached'; return 1; }
+            code=${answer##*$'\n'}
+            answer=${answer%$'\n'*}
+            [[ "$code" == 200 ]] || { why="bridge: POST /pool-checkout answered HTTP $code ($(jq -r '.error // empty' <<<"$answer" 2>/dev/null | tr -cd '[:print:]' | head -c 160))"; return 1; }
+            token=$(jq -r '.token // empty' <<<"$answer")
+            [[ -n "$token" ]] || { why='bridge: the bridge returned no token'; return 1; }
+            echo "::add-mask::$token"
+          }
+          # The token reaches git through the environment, never argv or a config file: no credential outlives the step.
+          authed() {
+            local basic
+            basic=$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')
+            echo "::add-mask::$basic"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" git "$@" 2>"$err"
+          }
+          # A failed fetch, named by its class: git's own fetch lines say nothing of the private tree.
+          fetch_why() {
+            local e
+            e=$(grep -E '^(fatal|error|remote):' "$err" | tail -2 | tr '\n' ' ' | tr -cd '[:print:]' | head -c 200)
+            case "$e" in
+              *'not found'* | *' 404'*) why="checkout: $1 404s (Repository not found) — $e" ;;
+              *'expected'*'packfile'*) why="checkout: $1 ended before its packfile — $e" ;;
+              *promisor*) why="checkout: $1 could not reach its promisor remote — $e" ;;
+              *) why="checkout: $1 failed — $e" ;;
+            esac
+          }
+          attempt() {
+            mint || return 1
+            git init -q . && { git remote remove origin 2>/dev/null; git remote add origin "$url"; } || { why='checkout: the workspace could not be initialised'; return 1; }
+            authed fetch --no-tags --prune --no-recurse-submodules origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || { fetch_why 'the fetch of the private branches'; return 1; }
+            if ! git cat-file -e "$IN_CHECKOUT_SHA^{commit}" 2>/dev/null; then
+              authed fetch --no-tags --no-recurse-submodules origin "$IN_CHECKOUT_SHA" || { fetch_why "the fetch of checkout_sha $IN_CHECKOUT_SHA"; return 1; }
+            fi
+            git checkout -q --force --detach "$IN_CHECKOUT_SHA" 2>/dev/null || { why="checkout: checkout_sha $IN_CHECKOUT_SHA could not be checked out"; return 1; }
+            rm -rf "$TRUSTED" && git init -q "$TRUSTED" && git -C "$TRUSTED" remote add origin "$url" && git -C "$TRUSTED" sparse-checkout set tooling/ci .github/actions || { why="checkout: $TRUSTED could not be initialised"; return 1; }
+            authed -C "$TRUSTED" fetch --no-tags --depth 1 origin '+refs/heads/main:refs/remotes/origin/main' || { fetch_why "the fetch of private main into $TRUSTED"; return 1; }
+            git -C "$TRUSTED" checkout -q --force -B main refs/remotes/origin/main 2>/dev/null || { why="checkout: private main could not be checked out into $TRUSTED"; return 1; }
+          }
+          for n in "${!wait_s[@]}"; do
+            if (( n > 0 )); then
+              echo "::warning::pool checkout attempt $n of ${#wait_s[@]} failed ($why); retrying in ${wait_s[n]} s with a fresh bridge token"
+              sleep "${wait_s[n]}"
+            fi
+            if attempt; then
+              echo "pool checkout: the private code at $IN_CHECKOUT_SHA and private main's tooling, attempt $((n + 1)) of ${#wait_s[@]}"
+              exit 0
+            fi
+          done
+          echo "::error::POOL-INFRA $why (after ${#wait_s[@]} attempts, each with a fresh bridge token)"
+          exit 1
       - name: Keep private main's copies out of the checked-out tree
         run: printf '/.pool-trusted/\n' >> "$(git rev-parse --git-path info/exclude)"
       - name: Name the private commit (the shell prelude's identity, from the parent run)
@@ -1898,38 +2178,78 @@ jobs:
           jq -e --argjson want '["app"]' 'type == "object" and ((keys | sort) == ($want | sort)) and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,100}$") and . != "." and . != "..")' <<<"$IN_MATRIX" >/dev/null || { echo "::error::matrix is not this job's {key: value}"; exit 1; }
           jq -e --argjson want '{}' 'type == "object" and ((keys | sort) == ($want | keys | sort)) and all(to_entries[]; (.value | type == "object") and ((.value | keys | sort) == ($want[.key] | sort)) and all(.value[]; type == "string" and length <= 4096))' <<<"$IN_NEEDS" >/dev/null || { echo "::error::needs is not exactly the outputs this job reads"; exit 1; }
           jq -e 'type == "object" and ((keys - ["event","ref","base_sha","base_ref","pr"]) | length == 0) and ((.event // "") | test("^[a-z_]{0,32}$")) and ((.ref // "") | test("^(refs/(heads|tags|pull)/[A-Za-z0-9._/-]{1,200})?$")) and ((.base_sha // "") | test("^([0-9a-f]{40})?$")) and ((.base_ref // "") | test("^[A-Za-z0-9._/-]{0,200}$")) and ((.pr // "") | tostring | test("^([1-9][0-9]{0,9})?$"))' <<<"$IN_IDENTITY" >/dev/null || { echo "::error::identity is not the parent's {event, ref, base_sha, base_ref, pr}"; exit 1; }
-      - name: A read-only token for the private code (the bridge's POST /pool-checkout)
+      - name: Check out the private code with the bridge's read-only token (POST /pool-checkout), retried with a fresh one
         id: pool-checkout
+        shell: bash
         env:
           IN_SHA: ${{ inputs.sha }}
+          IN_CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+          IN_REPO: com-nikatru/Nikatru_Private
           BRIDGE: https://gh-bridge.nikatru.workers.dev
+          TRUSTED: .pool-trusted
         run: |
-          set -euo pipefail
-          oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value)
-          echo "::add-mask::$oidc"
-          answer=$(curl -fsS --retry 3 -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout")
-          token=$(jq -r .token <<<"$answer")
-          [[ -n "$token" && "$token" != null ]] || { echo "::error::the bridge returned no token"; exit 1; }
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: ${{ inputs.checkout_sha }}
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Check out private main's step wrapper and composite actions
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: main
-          path: .pool-trusted
-          sparse-checkout: |
-            tooling/ci
-            .github/actions
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
+          set -uo pipefail
+          # The bridge's token can 404 a fetch until it propagates: each retry asks for a FRESH one (pool-checkout.ts POOL_MINTS_PER_ATTEMPT).
+          wait_s=(0 10 30 60)
+          url="https://github.com/$IN_REPO"
+          token=''
+          why=''
+          err="${RUNNER_TEMP:-/tmp}/pool-git.err"
+          mint() {
+            local oidc answer code
+            oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value) || { why='bridge: the OIDC token could not be minted'; return 1; }
+            [[ -n "$oidc" && "$oidc" != null ]] || { why='bridge: the OIDC answer held no token'; return 1; }
+            echo "::add-mask::$oidc"
+            answer=$(curl -sS --retry 3 -w '\n%{http_code}' -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout") || { why='bridge: POST /pool-checkout could not be reached'; return 1; }
+            code=${answer##*$'\n'}
+            answer=${answer%$'\n'*}
+            [[ "$code" == 200 ]] || { why="bridge: POST /pool-checkout answered HTTP $code ($(jq -r '.error // empty' <<<"$answer" 2>/dev/null | tr -cd '[:print:]' | head -c 160))"; return 1; }
+            token=$(jq -r '.token // empty' <<<"$answer")
+            [[ -n "$token" ]] || { why='bridge: the bridge returned no token'; return 1; }
+            echo "::add-mask::$token"
+          }
+          # The token reaches git through the environment, never argv or a config file: no credential outlives the step.
+          authed() {
+            local basic
+            basic=$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')
+            echo "::add-mask::$basic"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" git "$@" 2>"$err"
+          }
+          # A failed fetch, named by its class: git's own fetch lines say nothing of the private tree.
+          fetch_why() {
+            local e
+            e=$(grep -E '^(fatal|error|remote):' "$err" | tail -2 | tr '\n' ' ' | tr -cd '[:print:]' | head -c 200)
+            case "$e" in
+              *'not found'* | *' 404'*) why="checkout: $1 404s (Repository not found) — $e" ;;
+              *'expected'*'packfile'*) why="checkout: $1 ended before its packfile — $e" ;;
+              *promisor*) why="checkout: $1 could not reach its promisor remote — $e" ;;
+              *) why="checkout: $1 failed — $e" ;;
+            esac
+          }
+          attempt() {
+            mint || return 1
+            git init -q . && { git remote remove origin 2>/dev/null; git remote add origin "$url"; } || { why='checkout: the workspace could not be initialised'; return 1; }
+            authed fetch --no-tags --prune --no-recurse-submodules origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || { fetch_why 'the fetch of the private branches'; return 1; }
+            if ! git cat-file -e "$IN_CHECKOUT_SHA^{commit}" 2>/dev/null; then
+              authed fetch --no-tags --no-recurse-submodules origin "$IN_CHECKOUT_SHA" || { fetch_why "the fetch of checkout_sha $IN_CHECKOUT_SHA"; return 1; }
+            fi
+            git checkout -q --force --detach "$IN_CHECKOUT_SHA" 2>/dev/null || { why="checkout: checkout_sha $IN_CHECKOUT_SHA could not be checked out"; return 1; }
+            rm -rf "$TRUSTED" && git init -q "$TRUSTED" && git -C "$TRUSTED" remote add origin "$url" && git -C "$TRUSTED" sparse-checkout set tooling/ci .github/actions || { why="checkout: $TRUSTED could not be initialised"; return 1; }
+            authed -C "$TRUSTED" fetch --no-tags --depth 1 origin '+refs/heads/main:refs/remotes/origin/main' || { fetch_why "the fetch of private main into $TRUSTED"; return 1; }
+            git -C "$TRUSTED" checkout -q --force -B main refs/remotes/origin/main 2>/dev/null || { why="checkout: private main could not be checked out into $TRUSTED"; return 1; }
+          }
+          for n in "${!wait_s[@]}"; do
+            if (( n > 0 )); then
+              echo "::warning::pool checkout attempt $n of ${#wait_s[@]} failed ($why); retrying in ${wait_s[n]} s with a fresh bridge token"
+              sleep "${wait_s[n]}"
+            fi
+            if attempt; then
+              echo "pool checkout: the private code at $IN_CHECKOUT_SHA and private main's tooling, attempt $((n + 1)) of ${#wait_s[@]}"
+              exit 0
+            fi
+          done
+          echo "::error::POOL-INFRA $why (after ${#wait_s[@]} attempts, each with a fresh bridge token)"
+          exit 1
       - name: Keep private main's copies out of the checked-out tree
         run: printf '/.pool-trusted/\n' >> "$(git rev-parse --git-path info/exclude)"
       - name: Name the private commit (the shell prelude's identity, from the parent run)
@@ -2001,38 +2321,78 @@ jobs:
           jq -e --argjson want '["app"]' 'type == "object" and ((keys | sort) == ($want | sort)) and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,100}$") and . != "." and . != "..")' <<<"$IN_MATRIX" >/dev/null || { echo "::error::matrix is not this job's {key: value}"; exit 1; }
           jq -e --argjson want '{"prepare":["apps"]}' 'type == "object" and ((keys | sort) == ($want | keys | sort)) and all(to_entries[]; (.value | type == "object") and ((.value | keys | sort) == ($want[.key] | sort)) and all(.value[]; type == "string" and length <= 4096))' <<<"$IN_NEEDS" >/dev/null || { echo "::error::needs is not exactly the outputs this job reads"; exit 1; }
           jq -e 'type == "object" and ((keys - ["event","ref","base_sha","base_ref","pr"]) | length == 0) and ((.event // "") | test("^[a-z_]{0,32}$")) and ((.ref // "") | test("^(refs/(heads|tags|pull)/[A-Za-z0-9._/-]{1,200})?$")) and ((.base_sha // "") | test("^([0-9a-f]{40})?$")) and ((.base_ref // "") | test("^[A-Za-z0-9._/-]{0,200}$")) and ((.pr // "") | tostring | test("^([1-9][0-9]{0,9})?$"))' <<<"$IN_IDENTITY" >/dev/null || { echo "::error::identity is not the parent's {event, ref, base_sha, base_ref, pr}"; exit 1; }
-      - name: A read-only token for the private code (the bridge's POST /pool-checkout)
+      - name: Check out the private code with the bridge's read-only token (POST /pool-checkout), retried with a fresh one
         id: pool-checkout
+        shell: bash
         env:
           IN_SHA: ${{ inputs.sha }}
+          IN_CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+          IN_REPO: com-nikatru/Nikatru_Private
           BRIDGE: https://gh-bridge.nikatru.workers.dev
+          TRUSTED: .pool-trusted
         run: |
-          set -euo pipefail
-          oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value)
-          echo "::add-mask::$oidc"
-          answer=$(curl -fsS --retry 3 -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout")
-          token=$(jq -r .token <<<"$answer")
-          [[ -n "$token" && "$token" != null ]] || { echo "::error::the bridge returned no token"; exit 1; }
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: ${{ inputs.checkout_sha }}
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Check out private main's step wrapper and composite actions
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: main
-          path: .pool-trusted
-          sparse-checkout: |
-            tooling/ci
-            .github/actions
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
+          set -uo pipefail
+          # The bridge's token can 404 a fetch until it propagates: each retry asks for a FRESH one (pool-checkout.ts POOL_MINTS_PER_ATTEMPT).
+          wait_s=(0 10 30 60)
+          url="https://github.com/$IN_REPO"
+          token=''
+          why=''
+          err="${RUNNER_TEMP:-/tmp}/pool-git.err"
+          mint() {
+            local oidc answer code
+            oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value) || { why='bridge: the OIDC token could not be minted'; return 1; }
+            [[ -n "$oidc" && "$oidc" != null ]] || { why='bridge: the OIDC answer held no token'; return 1; }
+            echo "::add-mask::$oidc"
+            answer=$(curl -sS --retry 3 -w '\n%{http_code}' -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout") || { why='bridge: POST /pool-checkout could not be reached'; return 1; }
+            code=${answer##*$'\n'}
+            answer=${answer%$'\n'*}
+            [[ "$code" == 200 ]] || { why="bridge: POST /pool-checkout answered HTTP $code ($(jq -r '.error // empty' <<<"$answer" 2>/dev/null | tr -cd '[:print:]' | head -c 160))"; return 1; }
+            token=$(jq -r '.token // empty' <<<"$answer")
+            [[ -n "$token" ]] || { why='bridge: the bridge returned no token'; return 1; }
+            echo "::add-mask::$token"
+          }
+          # The token reaches git through the environment, never argv or a config file: no credential outlives the step.
+          authed() {
+            local basic
+            basic=$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')
+            echo "::add-mask::$basic"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" git "$@" 2>"$err"
+          }
+          # A failed fetch, named by its class: git's own fetch lines say nothing of the private tree.
+          fetch_why() {
+            local e
+            e=$(grep -E '^(fatal|error|remote):' "$err" | tail -2 | tr '\n' ' ' | tr -cd '[:print:]' | head -c 200)
+            case "$e" in
+              *'not found'* | *' 404'*) why="checkout: $1 404s (Repository not found) — $e" ;;
+              *'expected'*'packfile'*) why="checkout: $1 ended before its packfile — $e" ;;
+              *promisor*) why="checkout: $1 could not reach its promisor remote — $e" ;;
+              *) why="checkout: $1 failed — $e" ;;
+            esac
+          }
+          attempt() {
+            mint || return 1
+            git init -q . && { git remote remove origin 2>/dev/null; git remote add origin "$url"; } || { why='checkout: the workspace could not be initialised'; return 1; }
+            authed fetch --no-tags --prune --no-recurse-submodules origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || { fetch_why 'the fetch of the private branches'; return 1; }
+            if ! git cat-file -e "$IN_CHECKOUT_SHA^{commit}" 2>/dev/null; then
+              authed fetch --no-tags --no-recurse-submodules origin "$IN_CHECKOUT_SHA" || { fetch_why "the fetch of checkout_sha $IN_CHECKOUT_SHA"; return 1; }
+            fi
+            git checkout -q --force --detach "$IN_CHECKOUT_SHA" 2>/dev/null || { why="checkout: checkout_sha $IN_CHECKOUT_SHA could not be checked out"; return 1; }
+            rm -rf "$TRUSTED" && git init -q "$TRUSTED" && git -C "$TRUSTED" remote add origin "$url" && git -C "$TRUSTED" sparse-checkout set tooling/ci .github/actions || { why="checkout: $TRUSTED could not be initialised"; return 1; }
+            authed -C "$TRUSTED" fetch --no-tags --depth 1 origin '+refs/heads/main:refs/remotes/origin/main' || { fetch_why "the fetch of private main into $TRUSTED"; return 1; }
+            git -C "$TRUSTED" checkout -q --force -B main refs/remotes/origin/main 2>/dev/null || { why="checkout: private main could not be checked out into $TRUSTED"; return 1; }
+          }
+          for n in "${!wait_s[@]}"; do
+            if (( n > 0 )); then
+              echo "::warning::pool checkout attempt $n of ${#wait_s[@]} failed ($why); retrying in ${wait_s[n]} s with a fresh bridge token"
+              sleep "${wait_s[n]}"
+            fi
+            if attempt; then
+              echo "pool checkout: the private code at $IN_CHECKOUT_SHA and private main's tooling, attempt $((n + 1)) of ${#wait_s[@]}"
+              exit 0
+            fi
+          done
+          echo "::error::POOL-INFRA $why (after ${#wait_s[@]} attempts, each with a fresh bridge token)"
+          exit 1
       - name: Keep private main's copies out of the checked-out tree
         run: printf '/.pool-trusted/\n' >> "$(git rev-parse --git-path info/exclude)"
       - name: Name the private commit (the shell prelude's identity, from the parent run)
@@ -2238,38 +2598,78 @@ jobs:
           jq -e --argjson want '["app"]' 'type == "object" and ((keys | sort) == ($want | sort)) and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,100}$") and . != "." and . != "..")' <<<"$IN_MATRIX" >/dev/null || { echo "::error::matrix is not this job's {key: value}"; exit 1; }
           jq -e --argjson want '{}' 'type == "object" and ((keys | sort) == ($want | keys | sort)) and all(to_entries[]; (.value | type == "object") and ((.value | keys | sort) == ($want[.key] | sort)) and all(.value[]; type == "string" and length <= 4096))' <<<"$IN_NEEDS" >/dev/null || { echo "::error::needs is not exactly the outputs this job reads"; exit 1; }
           jq -e 'type == "object" and ((keys - ["event","ref","base_sha","base_ref","pr"]) | length == 0) and ((.event // "") | test("^[a-z_]{0,32}$")) and ((.ref // "") | test("^(refs/(heads|tags|pull)/[A-Za-z0-9._/-]{1,200})?$")) and ((.base_sha // "") | test("^([0-9a-f]{40})?$")) and ((.base_ref // "") | test("^[A-Za-z0-9._/-]{0,200}$")) and ((.pr // "") | tostring | test("^([1-9][0-9]{0,9})?$"))' <<<"$IN_IDENTITY" >/dev/null || { echo "::error::identity is not the parent's {event, ref, base_sha, base_ref, pr}"; exit 1; }
-      - name: A read-only token for the private code (the bridge's POST /pool-checkout)
+      - name: Check out the private code with the bridge's read-only token (POST /pool-checkout), retried with a fresh one
         id: pool-checkout
+        shell: bash
         env:
           IN_SHA: ${{ inputs.sha }}
+          IN_CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+          IN_REPO: com-nikatru/Nikatru_Private
           BRIDGE: https://gh-bridge.nikatru.workers.dev
+          TRUSTED: .pool-trusted
         run: |
-          set -euo pipefail
-          oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value)
-          echo "::add-mask::$oidc"
-          answer=$(curl -fsS --retry 3 -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout")
-          token=$(jq -r .token <<<"$answer")
-          [[ -n "$token" && "$token" != null ]] || { echo "::error::the bridge returned no token"; exit 1; }
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: ${{ inputs.checkout_sha }}
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Check out private main's step wrapper and composite actions
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: main
-          path: .pool-trusted
-          sparse-checkout: |
-            tooling/ci
-            .github/actions
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
+          set -uo pipefail
+          # The bridge's token can 404 a fetch until it propagates: each retry asks for a FRESH one (pool-checkout.ts POOL_MINTS_PER_ATTEMPT).
+          wait_s=(0 10 30 60)
+          url="https://github.com/$IN_REPO"
+          token=''
+          why=''
+          err="${RUNNER_TEMP:-/tmp}/pool-git.err"
+          mint() {
+            local oidc answer code
+            oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value) || { why='bridge: the OIDC token could not be minted'; return 1; }
+            [[ -n "$oidc" && "$oidc" != null ]] || { why='bridge: the OIDC answer held no token'; return 1; }
+            echo "::add-mask::$oidc"
+            answer=$(curl -sS --retry 3 -w '\n%{http_code}' -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout") || { why='bridge: POST /pool-checkout could not be reached'; return 1; }
+            code=${answer##*$'\n'}
+            answer=${answer%$'\n'*}
+            [[ "$code" == 200 ]] || { why="bridge: POST /pool-checkout answered HTTP $code ($(jq -r '.error // empty' <<<"$answer" 2>/dev/null | tr -cd '[:print:]' | head -c 160))"; return 1; }
+            token=$(jq -r '.token // empty' <<<"$answer")
+            [[ -n "$token" ]] || { why='bridge: the bridge returned no token'; return 1; }
+            echo "::add-mask::$token"
+          }
+          # The token reaches git through the environment, never argv or a config file: no credential outlives the step.
+          authed() {
+            local basic
+            basic=$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')
+            echo "::add-mask::$basic"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" git "$@" 2>"$err"
+          }
+          # A failed fetch, named by its class: git's own fetch lines say nothing of the private tree.
+          fetch_why() {
+            local e
+            e=$(grep -E '^(fatal|error|remote):' "$err" | tail -2 | tr '\n' ' ' | tr -cd '[:print:]' | head -c 200)
+            case "$e" in
+              *'not found'* | *' 404'*) why="checkout: $1 404s (Repository not found) — $e" ;;
+              *'expected'*'packfile'*) why="checkout: $1 ended before its packfile — $e" ;;
+              *promisor*) why="checkout: $1 could not reach its promisor remote — $e" ;;
+              *) why="checkout: $1 failed — $e" ;;
+            esac
+          }
+          attempt() {
+            mint || return 1
+            git init -q . && { git remote remove origin 2>/dev/null; git remote add origin "$url"; } || { why='checkout: the workspace could not be initialised'; return 1; }
+            authed fetch --no-tags --prune --no-recurse-submodules origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || { fetch_why 'the fetch of the private branches'; return 1; }
+            if ! git cat-file -e "$IN_CHECKOUT_SHA^{commit}" 2>/dev/null; then
+              authed fetch --no-tags --no-recurse-submodules origin "$IN_CHECKOUT_SHA" || { fetch_why "the fetch of checkout_sha $IN_CHECKOUT_SHA"; return 1; }
+            fi
+            git checkout -q --force --detach "$IN_CHECKOUT_SHA" 2>/dev/null || { why="checkout: checkout_sha $IN_CHECKOUT_SHA could not be checked out"; return 1; }
+            rm -rf "$TRUSTED" && git init -q "$TRUSTED" && git -C "$TRUSTED" remote add origin "$url" && git -C "$TRUSTED" sparse-checkout set tooling/ci .github/actions || { why="checkout: $TRUSTED could not be initialised"; return 1; }
+            authed -C "$TRUSTED" fetch --no-tags --depth 1 origin '+refs/heads/main:refs/remotes/origin/main' || { fetch_why "the fetch of private main into $TRUSTED"; return 1; }
+            git -C "$TRUSTED" checkout -q --force -B main refs/remotes/origin/main 2>/dev/null || { why="checkout: private main could not be checked out into $TRUSTED"; return 1; }
+          }
+          for n in "${!wait_s[@]}"; do
+            if (( n > 0 )); then
+              echo "::warning::pool checkout attempt $n of ${#wait_s[@]} failed ($why); retrying in ${wait_s[n]} s with a fresh bridge token"
+              sleep "${wait_s[n]}"
+            fi
+            if attempt; then
+              echo "pool checkout: the private code at $IN_CHECKOUT_SHA and private main's tooling, attempt $((n + 1)) of ${#wait_s[@]}"
+              exit 0
+            fi
+          done
+          echo "::error::POOL-INFRA $why (after ${#wait_s[@]} attempts, each with a fresh bridge token)"
+          exit 1
       - name: Keep private main's copies out of the checked-out tree
         run: printf '/.pool-trusted/\n' >> "$(git rev-parse --git-path info/exclude)"
       - name: Name the private commit (the shell prelude's identity, from the parent run)
@@ -2451,38 +2851,78 @@ jobs:
           jq -e --argjson want '["app","arch"]' 'type == "object" and ((keys | sort) == ($want | sort)) and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,100}$") and . != "." and . != "..")' <<<"$IN_MATRIX" >/dev/null || { echo "::error::matrix is not this job's {key: value}"; exit 1; }
           jq -e --argjson want '{}' 'type == "object" and ((keys | sort) == ($want | keys | sort)) and all(to_entries[]; (.value | type == "object") and ((.value | keys | sort) == ($want[.key] | sort)) and all(.value[]; type == "string" and length <= 4096))' <<<"$IN_NEEDS" >/dev/null || { echo "::error::needs is not exactly the outputs this job reads"; exit 1; }
           jq -e 'type == "object" and ((keys - ["event","ref","base_sha","base_ref","pr"]) | length == 0) and ((.event // "") | test("^[a-z_]{0,32}$")) and ((.ref // "") | test("^(refs/(heads|tags|pull)/[A-Za-z0-9._/-]{1,200})?$")) and ((.base_sha // "") | test("^([0-9a-f]{40})?$")) and ((.base_ref // "") | test("^[A-Za-z0-9._/-]{0,200}$")) and ((.pr // "") | tostring | test("^([1-9][0-9]{0,9})?$"))' <<<"$IN_IDENTITY" >/dev/null || { echo "::error::identity is not the parent's {event, ref, base_sha, base_ref, pr}"; exit 1; }
-      - name: A read-only token for the private code (the bridge's POST /pool-checkout)
+      - name: Check out the private code with the bridge's read-only token (POST /pool-checkout), retried with a fresh one
         id: pool-checkout
+        shell: bash
         env:
           IN_SHA: ${{ inputs.sha }}
+          IN_CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+          IN_REPO: com-nikatru/Nikatru_Private
           BRIDGE: https://gh-bridge.nikatru.workers.dev
+          TRUSTED: .pool-trusted
         run: |
-          set -euo pipefail
-          oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value)
-          echo "::add-mask::$oidc"
-          answer=$(curl -fsS --retry 3 -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout")
-          token=$(jq -r .token <<<"$answer")
-          [[ -n "$token" && "$token" != null ]] || { echo "::error::the bridge returned no token"; exit 1; }
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: ${{ inputs.checkout_sha }}
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Check out private main's step wrapper and composite actions
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: main
-          path: .pool-trusted
-          sparse-checkout: |
-            tooling/ci
-            .github/actions
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
+          set -uo pipefail
+          # The bridge's token can 404 a fetch until it propagates: each retry asks for a FRESH one (pool-checkout.ts POOL_MINTS_PER_ATTEMPT).
+          wait_s=(0 10 30 60)
+          url="https://github.com/$IN_REPO"
+          token=''
+          why=''
+          err="${RUNNER_TEMP:-/tmp}/pool-git.err"
+          mint() {
+            local oidc answer code
+            oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value) || { why='bridge: the OIDC token could not be minted'; return 1; }
+            [[ -n "$oidc" && "$oidc" != null ]] || { why='bridge: the OIDC answer held no token'; return 1; }
+            echo "::add-mask::$oidc"
+            answer=$(curl -sS --retry 3 -w '\n%{http_code}' -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout") || { why='bridge: POST /pool-checkout could not be reached'; return 1; }
+            code=${answer##*$'\n'}
+            answer=${answer%$'\n'*}
+            [[ "$code" == 200 ]] || { why="bridge: POST /pool-checkout answered HTTP $code ($(jq -r '.error // empty' <<<"$answer" 2>/dev/null | tr -cd '[:print:]' | head -c 160))"; return 1; }
+            token=$(jq -r '.token // empty' <<<"$answer")
+            [[ -n "$token" ]] || { why='bridge: the bridge returned no token'; return 1; }
+            echo "::add-mask::$token"
+          }
+          # The token reaches git through the environment, never argv or a config file: no credential outlives the step.
+          authed() {
+            local basic
+            basic=$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')
+            echo "::add-mask::$basic"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" git "$@" 2>"$err"
+          }
+          # A failed fetch, named by its class: git's own fetch lines say nothing of the private tree.
+          fetch_why() {
+            local e
+            e=$(grep -E '^(fatal|error|remote):' "$err" | tail -2 | tr '\n' ' ' | tr -cd '[:print:]' | head -c 200)
+            case "$e" in
+              *'not found'* | *' 404'*) why="checkout: $1 404s (Repository not found) — $e" ;;
+              *'expected'*'packfile'*) why="checkout: $1 ended before its packfile — $e" ;;
+              *promisor*) why="checkout: $1 could not reach its promisor remote — $e" ;;
+              *) why="checkout: $1 failed — $e" ;;
+            esac
+          }
+          attempt() {
+            mint || return 1
+            git init -q . && { git remote remove origin 2>/dev/null; git remote add origin "$url"; } || { why='checkout: the workspace could not be initialised'; return 1; }
+            authed fetch --no-tags --prune --no-recurse-submodules origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || { fetch_why 'the fetch of the private branches'; return 1; }
+            if ! git cat-file -e "$IN_CHECKOUT_SHA^{commit}" 2>/dev/null; then
+              authed fetch --no-tags --no-recurse-submodules origin "$IN_CHECKOUT_SHA" || { fetch_why "the fetch of checkout_sha $IN_CHECKOUT_SHA"; return 1; }
+            fi
+            git checkout -q --force --detach "$IN_CHECKOUT_SHA" 2>/dev/null || { why="checkout: checkout_sha $IN_CHECKOUT_SHA could not be checked out"; return 1; }
+            rm -rf "$TRUSTED" && git init -q "$TRUSTED" && git -C "$TRUSTED" remote add origin "$url" && git -C "$TRUSTED" sparse-checkout set tooling/ci .github/actions || { why="checkout: $TRUSTED could not be initialised"; return 1; }
+            authed -C "$TRUSTED" fetch --no-tags --depth 1 origin '+refs/heads/main:refs/remotes/origin/main' || { fetch_why "the fetch of private main into $TRUSTED"; return 1; }
+            git -C "$TRUSTED" checkout -q --force -B main refs/remotes/origin/main 2>/dev/null || { why="checkout: private main could not be checked out into $TRUSTED"; return 1; }
+          }
+          for n in "${!wait_s[@]}"; do
+            if (( n > 0 )); then
+              echo "::warning::pool checkout attempt $n of ${#wait_s[@]} failed ($why); retrying in ${wait_s[n]} s with a fresh bridge token"
+              sleep "${wait_s[n]}"
+            fi
+            if attempt; then
+              echo "pool checkout: the private code at $IN_CHECKOUT_SHA and private main's tooling, attempt $((n + 1)) of ${#wait_s[@]}"
+              exit 0
+            fi
+          done
+          echo "::error::POOL-INFRA $why (after ${#wait_s[@]} attempts, each with a fresh bridge token)"
+          exit 1
       - name: Keep private main's copies out of the checked-out tree
         run: printf '/.pool-trusted/\n' >> "$(git rev-parse --git-path info/exclude)"
       - name: Name the private commit (the shell prelude's identity, from the parent run)
@@ -2574,38 +3014,78 @@ jobs:
           jq -e --argjson want '[]' 'type == "object" and ((keys | sort) == ($want | sort)) and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,100}$") and . != "." and . != "..")' <<<"$IN_MATRIX" >/dev/null || { echo "::error::matrix is not this job's {key: value}"; exit 1; }
           jq -e --argjson want '{}' 'type == "object" and ((keys | sort) == ($want | keys | sort)) and all(to_entries[]; (.value | type == "object") and ((.value | keys | sort) == ($want[.key] | sort)) and all(.value[]; type == "string" and length <= 4096))' <<<"$IN_NEEDS" >/dev/null || { echo "::error::needs is not exactly the outputs this job reads"; exit 1; }
           jq -e 'type == "object" and ((keys - ["event","ref","base_sha","base_ref","pr"]) | length == 0) and ((.event // "") | test("^[a-z_]{0,32}$")) and ((.ref // "") | test("^(refs/(heads|tags|pull)/[A-Za-z0-9._/-]{1,200})?$")) and ((.base_sha // "") | test("^([0-9a-f]{40})?$")) and ((.base_ref // "") | test("^[A-Za-z0-9._/-]{0,200}$")) and ((.pr // "") | tostring | test("^([1-9][0-9]{0,9})?$"))' <<<"$IN_IDENTITY" >/dev/null || { echo "::error::identity is not the parent's {event, ref, base_sha, base_ref, pr}"; exit 1; }
-      - name: A read-only token for the private code (the bridge's POST /pool-checkout)
+      - name: Check out the private code with the bridge's read-only token (POST /pool-checkout), retried with a fresh one
         id: pool-checkout
+        shell: bash
         env:
           IN_SHA: ${{ inputs.sha }}
+          IN_CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+          IN_REPO: com-nikatru/Nikatru_Private
           BRIDGE: https://gh-bridge.nikatru.workers.dev
+          TRUSTED: .pool-trusted
         run: |
-          set -euo pipefail
-          oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value)
-          echo "::add-mask::$oidc"
-          answer=$(curl -fsS --retry 3 -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout")
-          token=$(jq -r .token <<<"$answer")
-          [[ -n "$token" && "$token" != null ]] || { echo "::error::the bridge returned no token"; exit 1; }
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: ${{ inputs.checkout_sha }}
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Check out private main's step wrapper and composite actions
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: main
-          path: .pool-trusted
-          sparse-checkout: |
-            tooling/ci
-            .github/actions
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
+          set -uo pipefail
+          # The bridge's token can 404 a fetch until it propagates: each retry asks for a FRESH one (pool-checkout.ts POOL_MINTS_PER_ATTEMPT).
+          wait_s=(0 10 30 60)
+          url="https://github.com/$IN_REPO"
+          token=''
+          why=''
+          err="${RUNNER_TEMP:-/tmp}/pool-git.err"
+          mint() {
+            local oidc answer code
+            oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value) || { why='bridge: the OIDC token could not be minted'; return 1; }
+            [[ -n "$oidc" && "$oidc" != null ]] || { why='bridge: the OIDC answer held no token'; return 1; }
+            echo "::add-mask::$oidc"
+            answer=$(curl -sS --retry 3 -w '\n%{http_code}' -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout") || { why='bridge: POST /pool-checkout could not be reached'; return 1; }
+            code=${answer##*$'\n'}
+            answer=${answer%$'\n'*}
+            [[ "$code" == 200 ]] || { why="bridge: POST /pool-checkout answered HTTP $code ($(jq -r '.error // empty' <<<"$answer" 2>/dev/null | tr -cd '[:print:]' | head -c 160))"; return 1; }
+            token=$(jq -r '.token // empty' <<<"$answer")
+            [[ -n "$token" ]] || { why='bridge: the bridge returned no token'; return 1; }
+            echo "::add-mask::$token"
+          }
+          # The token reaches git through the environment, never argv or a config file: no credential outlives the step.
+          authed() {
+            local basic
+            basic=$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')
+            echo "::add-mask::$basic"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" git "$@" 2>"$err"
+          }
+          # A failed fetch, named by its class: git's own fetch lines say nothing of the private tree.
+          fetch_why() {
+            local e
+            e=$(grep -E '^(fatal|error|remote):' "$err" | tail -2 | tr '\n' ' ' | tr -cd '[:print:]' | head -c 200)
+            case "$e" in
+              *'not found'* | *' 404'*) why="checkout: $1 404s (Repository not found) — $e" ;;
+              *'expected'*'packfile'*) why="checkout: $1 ended before its packfile — $e" ;;
+              *promisor*) why="checkout: $1 could not reach its promisor remote — $e" ;;
+              *) why="checkout: $1 failed — $e" ;;
+            esac
+          }
+          attempt() {
+            mint || return 1
+            git init -q . && { git remote remove origin 2>/dev/null; git remote add origin "$url"; } || { why='checkout: the workspace could not be initialised'; return 1; }
+            authed fetch --no-tags --prune --no-recurse-submodules origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || { fetch_why 'the fetch of the private branches'; return 1; }
+            if ! git cat-file -e "$IN_CHECKOUT_SHA^{commit}" 2>/dev/null; then
+              authed fetch --no-tags --no-recurse-submodules origin "$IN_CHECKOUT_SHA" || { fetch_why "the fetch of checkout_sha $IN_CHECKOUT_SHA"; return 1; }
+            fi
+            git checkout -q --force --detach "$IN_CHECKOUT_SHA" 2>/dev/null || { why="checkout: checkout_sha $IN_CHECKOUT_SHA could not be checked out"; return 1; }
+            rm -rf "$TRUSTED" && git init -q "$TRUSTED" && git -C "$TRUSTED" remote add origin "$url" && git -C "$TRUSTED" sparse-checkout set tooling/ci .github/actions || { why="checkout: $TRUSTED could not be initialised"; return 1; }
+            authed -C "$TRUSTED" fetch --no-tags --depth 1 origin '+refs/heads/main:refs/remotes/origin/main' || { fetch_why "the fetch of private main into $TRUSTED"; return 1; }
+            git -C "$TRUSTED" checkout -q --force -B main refs/remotes/origin/main 2>/dev/null || { why="checkout: private main could not be checked out into $TRUSTED"; return 1; }
+          }
+          for n in "${!wait_s[@]}"; do
+            if (( n > 0 )); then
+              echo "::warning::pool checkout attempt $n of ${#wait_s[@]} failed ($why); retrying in ${wait_s[n]} s with a fresh bridge token"
+              sleep "${wait_s[n]}"
+            fi
+            if attempt; then
+              echo "pool checkout: the private code at $IN_CHECKOUT_SHA and private main's tooling, attempt $((n + 1)) of ${#wait_s[@]}"
+              exit 0
+            fi
+          done
+          echo "::error::POOL-INFRA $why (after ${#wait_s[@]} attempts, each with a fresh bridge token)"
+          exit 1
       - name: Keep private main's copies out of the checked-out tree
         run: printf '/.pool-trusted/\n' >> "$(git rev-parse --git-path info/exclude)"
       - name: Name the private commit (the shell prelude's identity, from the parent run)
@@ -2688,38 +3168,78 @@ jobs:
           jq -e --argjson want '[]' 'type == "object" and ((keys | sort) == ($want | sort)) and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,100}$") and . != "." and . != "..")' <<<"$IN_MATRIX" >/dev/null || { echo "::error::matrix is not this job's {key: value}"; exit 1; }
           jq -e --argjson want '{}' 'type == "object" and ((keys | sort) == ($want | keys | sort)) and all(to_entries[]; (.value | type == "object") and ((.value | keys | sort) == ($want[.key] | sort)) and all(.value[]; type == "string" and length <= 4096))' <<<"$IN_NEEDS" >/dev/null || { echo "::error::needs is not exactly the outputs this job reads"; exit 1; }
           jq -e 'type == "object" and ((keys - ["event","ref","base_sha","base_ref","pr"]) | length == 0) and ((.event // "") | test("^[a-z_]{0,32}$")) and ((.ref // "") | test("^(refs/(heads|tags|pull)/[A-Za-z0-9._/-]{1,200})?$")) and ((.base_sha // "") | test("^([0-9a-f]{40})?$")) and ((.base_ref // "") | test("^[A-Za-z0-9._/-]{0,200}$")) and ((.pr // "") | tostring | test("^([1-9][0-9]{0,9})?$"))' <<<"$IN_IDENTITY" >/dev/null || { echo "::error::identity is not the parent's {event, ref, base_sha, base_ref, pr}"; exit 1; }
-      - name: A read-only token for the private code (the bridge's POST /pool-checkout)
+      - name: Check out the private code with the bridge's read-only token (POST /pool-checkout), retried with a fresh one
         id: pool-checkout
+        shell: bash
         env:
           IN_SHA: ${{ inputs.sha }}
+          IN_CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+          IN_REPO: com-nikatru/Nikatru_Private
           BRIDGE: https://gh-bridge.nikatru.workers.dev
+          TRUSTED: .pool-trusted
         run: |
-          set -euo pipefail
-          oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value)
-          echo "::add-mask::$oidc"
-          answer=$(curl -fsS --retry 3 -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout")
-          token=$(jq -r .token <<<"$answer")
-          [[ -n "$token" && "$token" != null ]] || { echo "::error::the bridge returned no token"; exit 1; }
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: ${{ inputs.checkout_sha }}
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Check out private main's step wrapper and composite actions
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: main
-          path: .pool-trusted
-          sparse-checkout: |
-            tooling/ci
-            .github/actions
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
+          set -uo pipefail
+          # The bridge's token can 404 a fetch until it propagates: each retry asks for a FRESH one (pool-checkout.ts POOL_MINTS_PER_ATTEMPT).
+          wait_s=(0 10 30 60)
+          url="https://github.com/$IN_REPO"
+          token=''
+          why=''
+          err="${RUNNER_TEMP:-/tmp}/pool-git.err"
+          mint() {
+            local oidc answer code
+            oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value) || { why='bridge: the OIDC token could not be minted'; return 1; }
+            [[ -n "$oidc" && "$oidc" != null ]] || { why='bridge: the OIDC answer held no token'; return 1; }
+            echo "::add-mask::$oidc"
+            answer=$(curl -sS --retry 3 -w '\n%{http_code}' -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout") || { why='bridge: POST /pool-checkout could not be reached'; return 1; }
+            code=${answer##*$'\n'}
+            answer=${answer%$'\n'*}
+            [[ "$code" == 200 ]] || { why="bridge: POST /pool-checkout answered HTTP $code ($(jq -r '.error // empty' <<<"$answer" 2>/dev/null | tr -cd '[:print:]' | head -c 160))"; return 1; }
+            token=$(jq -r '.token // empty' <<<"$answer")
+            [[ -n "$token" ]] || { why='bridge: the bridge returned no token'; return 1; }
+            echo "::add-mask::$token"
+          }
+          # The token reaches git through the environment, never argv or a config file: no credential outlives the step.
+          authed() {
+            local basic
+            basic=$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')
+            echo "::add-mask::$basic"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" git "$@" 2>"$err"
+          }
+          # A failed fetch, named by its class: git's own fetch lines say nothing of the private tree.
+          fetch_why() {
+            local e
+            e=$(grep -E '^(fatal|error|remote):' "$err" | tail -2 | tr '\n' ' ' | tr -cd '[:print:]' | head -c 200)
+            case "$e" in
+              *'not found'* | *' 404'*) why="checkout: $1 404s (Repository not found) — $e" ;;
+              *'expected'*'packfile'*) why="checkout: $1 ended before its packfile — $e" ;;
+              *promisor*) why="checkout: $1 could not reach its promisor remote — $e" ;;
+              *) why="checkout: $1 failed — $e" ;;
+            esac
+          }
+          attempt() {
+            mint || return 1
+            git init -q . && { git remote remove origin 2>/dev/null; git remote add origin "$url"; } || { why='checkout: the workspace could not be initialised'; return 1; }
+            authed fetch --no-tags --prune --no-recurse-submodules origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || { fetch_why 'the fetch of the private branches'; return 1; }
+            if ! git cat-file -e "$IN_CHECKOUT_SHA^{commit}" 2>/dev/null; then
+              authed fetch --no-tags --no-recurse-submodules origin "$IN_CHECKOUT_SHA" || { fetch_why "the fetch of checkout_sha $IN_CHECKOUT_SHA"; return 1; }
+            fi
+            git checkout -q --force --detach "$IN_CHECKOUT_SHA" 2>/dev/null || { why="checkout: checkout_sha $IN_CHECKOUT_SHA could not be checked out"; return 1; }
+            rm -rf "$TRUSTED" && git init -q "$TRUSTED" && git -C "$TRUSTED" remote add origin "$url" && git -C "$TRUSTED" sparse-checkout set tooling/ci .github/actions || { why="checkout: $TRUSTED could not be initialised"; return 1; }
+            authed -C "$TRUSTED" fetch --no-tags --depth 1 origin '+refs/heads/main:refs/remotes/origin/main' || { fetch_why "the fetch of private main into $TRUSTED"; return 1; }
+            git -C "$TRUSTED" checkout -q --force -B main refs/remotes/origin/main 2>/dev/null || { why="checkout: private main could not be checked out into $TRUSTED"; return 1; }
+          }
+          for n in "${!wait_s[@]}"; do
+            if (( n > 0 )); then
+              echo "::warning::pool checkout attempt $n of ${#wait_s[@]} failed ($why); retrying in ${wait_s[n]} s with a fresh bridge token"
+              sleep "${wait_s[n]}"
+            fi
+            if attempt; then
+              echo "pool checkout: the private code at $IN_CHECKOUT_SHA and private main's tooling, attempt $((n + 1)) of ${#wait_s[@]}"
+              exit 0
+            fi
+          done
+          echo "::error::POOL-INFRA $why (after ${#wait_s[@]} attempts, each with a fresh bridge token)"
+          exit 1
       - name: Keep private main's copies out of the checked-out tree
         run: printf '/.pool-trusted/\n' >> "$(git rev-parse --git-path info/exclude)"
       - name: Name the private commit (the shell prelude's identity, from the parent run)
@@ -2781,38 +3301,78 @@ jobs:
           jq -e --argjson want '[]' 'type == "object" and ((keys | sort) == ($want | sort)) and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,100}$") and . != "." and . != "..")' <<<"$IN_MATRIX" >/dev/null || { echo "::error::matrix is not this job's {key: value}"; exit 1; }
           jq -e --argjson want '{}' 'type == "object" and ((keys | sort) == ($want | keys | sort)) and all(to_entries[]; (.value | type == "object") and ((.value | keys | sort) == ($want[.key] | sort)) and all(.value[]; type == "string" and length <= 4096))' <<<"$IN_NEEDS" >/dev/null || { echo "::error::needs is not exactly the outputs this job reads"; exit 1; }
           jq -e 'type == "object" and ((keys - ["event","ref","base_sha","base_ref","pr"]) | length == 0) and ((.event // "") | test("^[a-z_]{0,32}$")) and ((.ref // "") | test("^(refs/(heads|tags|pull)/[A-Za-z0-9._/-]{1,200})?$")) and ((.base_sha // "") | test("^([0-9a-f]{40})?$")) and ((.base_ref // "") | test("^[A-Za-z0-9._/-]{0,200}$")) and ((.pr // "") | tostring | test("^([1-9][0-9]{0,9})?$"))' <<<"$IN_IDENTITY" >/dev/null || { echo "::error::identity is not the parent's {event, ref, base_sha, base_ref, pr}"; exit 1; }
-      - name: A read-only token for the private code (the bridge's POST /pool-checkout)
+      - name: Check out the private code with the bridge's read-only token (POST /pool-checkout), retried with a fresh one
         id: pool-checkout
+        shell: bash
         env:
           IN_SHA: ${{ inputs.sha }}
+          IN_CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+          IN_REPO: com-nikatru/Nikatru_Private
           BRIDGE: https://gh-bridge.nikatru.workers.dev
+          TRUSTED: .pool-trusted
         run: |
-          set -euo pipefail
-          oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value)
-          echo "::add-mask::$oidc"
-          answer=$(curl -fsS --retry 3 -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout")
-          token=$(jq -r .token <<<"$answer")
-          [[ -n "$token" && "$token" != null ]] || { echo "::error::the bridge returned no token"; exit 1; }
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: ${{ inputs.checkout_sha }}
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Check out private main's step wrapper and composite actions
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: main
-          path: .pool-trusted
-          sparse-checkout: |
-            tooling/ci
-            .github/actions
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
+          set -uo pipefail
+          # The bridge's token can 404 a fetch until it propagates: each retry asks for a FRESH one (pool-checkout.ts POOL_MINTS_PER_ATTEMPT).
+          wait_s=(0 10 30 60)
+          url="https://github.com/$IN_REPO"
+          token=''
+          why=''
+          err="${RUNNER_TEMP:-/tmp}/pool-git.err"
+          mint() {
+            local oidc answer code
+            oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value) || { why='bridge: the OIDC token could not be minted'; return 1; }
+            [[ -n "$oidc" && "$oidc" != null ]] || { why='bridge: the OIDC answer held no token'; return 1; }
+            echo "::add-mask::$oidc"
+            answer=$(curl -sS --retry 3 -w '\n%{http_code}' -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout") || { why='bridge: POST /pool-checkout could not be reached'; return 1; }
+            code=${answer##*$'\n'}
+            answer=${answer%$'\n'*}
+            [[ "$code" == 200 ]] || { why="bridge: POST /pool-checkout answered HTTP $code ($(jq -r '.error // empty' <<<"$answer" 2>/dev/null | tr -cd '[:print:]' | head -c 160))"; return 1; }
+            token=$(jq -r '.token // empty' <<<"$answer")
+            [[ -n "$token" ]] || { why='bridge: the bridge returned no token'; return 1; }
+            echo "::add-mask::$token"
+          }
+          # The token reaches git through the environment, never argv or a config file: no credential outlives the step.
+          authed() {
+            local basic
+            basic=$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')
+            echo "::add-mask::$basic"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" git "$@" 2>"$err"
+          }
+          # A failed fetch, named by its class: git's own fetch lines say nothing of the private tree.
+          fetch_why() {
+            local e
+            e=$(grep -E '^(fatal|error|remote):' "$err" | tail -2 | tr '\n' ' ' | tr -cd '[:print:]' | head -c 200)
+            case "$e" in
+              *'not found'* | *' 404'*) why="checkout: $1 404s (Repository not found) — $e" ;;
+              *'expected'*'packfile'*) why="checkout: $1 ended before its packfile — $e" ;;
+              *promisor*) why="checkout: $1 could not reach its promisor remote — $e" ;;
+              *) why="checkout: $1 failed — $e" ;;
+            esac
+          }
+          attempt() {
+            mint || return 1
+            git init -q . && { git remote remove origin 2>/dev/null; git remote add origin "$url"; } || { why='checkout: the workspace could not be initialised'; return 1; }
+            authed fetch --no-tags --prune --no-recurse-submodules origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || { fetch_why 'the fetch of the private branches'; return 1; }
+            if ! git cat-file -e "$IN_CHECKOUT_SHA^{commit}" 2>/dev/null; then
+              authed fetch --no-tags --no-recurse-submodules origin "$IN_CHECKOUT_SHA" || { fetch_why "the fetch of checkout_sha $IN_CHECKOUT_SHA"; return 1; }
+            fi
+            git checkout -q --force --detach "$IN_CHECKOUT_SHA" 2>/dev/null || { why="checkout: checkout_sha $IN_CHECKOUT_SHA could not be checked out"; return 1; }
+            rm -rf "$TRUSTED" && git init -q "$TRUSTED" && git -C "$TRUSTED" remote add origin "$url" && git -C "$TRUSTED" sparse-checkout set tooling/ci .github/actions || { why="checkout: $TRUSTED could not be initialised"; return 1; }
+            authed -C "$TRUSTED" fetch --no-tags --depth 1 origin '+refs/heads/main:refs/remotes/origin/main' || { fetch_why "the fetch of private main into $TRUSTED"; return 1; }
+            git -C "$TRUSTED" checkout -q --force -B main refs/remotes/origin/main 2>/dev/null || { why="checkout: private main could not be checked out into $TRUSTED"; return 1; }
+          }
+          for n in "${!wait_s[@]}"; do
+            if (( n > 0 )); then
+              echo "::warning::pool checkout attempt $n of ${#wait_s[@]} failed ($why); retrying in ${wait_s[n]} s with a fresh bridge token"
+              sleep "${wait_s[n]}"
+            fi
+            if attempt; then
+              echo "pool checkout: the private code at $IN_CHECKOUT_SHA and private main's tooling, attempt $((n + 1)) of ${#wait_s[@]}"
+              exit 0
+            fi
+          done
+          echo "::error::POOL-INFRA $why (after ${#wait_s[@]} attempts, each with a fresh bridge token)"
+          exit 1
       - name: Keep private main's copies out of the checked-out tree
         run: printf '/.pool-trusted/\n' >> "$(git rev-parse --git-path info/exclude)"
       - name: Name the private commit (the shell prelude's identity, from the parent run)
@@ -2895,38 +3455,78 @@ jobs:
           jq -e --argjson want '[]' 'type == "object" and ((keys | sort) == ($want | sort)) and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,100}$") and . != "." and . != "..")' <<<"$IN_MATRIX" >/dev/null || { echo "::error::matrix is not this job's {key: value}"; exit 1; }
           jq -e --argjson want '{}' 'type == "object" and ((keys | sort) == ($want | keys | sort)) and all(to_entries[]; (.value | type == "object") and ((.value | keys | sort) == ($want[.key] | sort)) and all(.value[]; type == "string" and length <= 4096))' <<<"$IN_NEEDS" >/dev/null || { echo "::error::needs is not exactly the outputs this job reads"; exit 1; }
           jq -e 'type == "object" and ((keys - ["event","ref","base_sha","base_ref","pr"]) | length == 0) and ((.event // "") | test("^[a-z_]{0,32}$")) and ((.ref // "") | test("^(refs/(heads|tags|pull)/[A-Za-z0-9._/-]{1,200})?$")) and ((.base_sha // "") | test("^([0-9a-f]{40})?$")) and ((.base_ref // "") | test("^[A-Za-z0-9._/-]{0,200}$")) and ((.pr // "") | tostring | test("^([1-9][0-9]{0,9})?$"))' <<<"$IN_IDENTITY" >/dev/null || { echo "::error::identity is not the parent's {event, ref, base_sha, base_ref, pr}"; exit 1; }
-      - name: A read-only token for the private code (the bridge's POST /pool-checkout)
+      - name: Check out the private code with the bridge's read-only token (POST /pool-checkout), retried with a fresh one
         id: pool-checkout
+        shell: bash
         env:
           IN_SHA: ${{ inputs.sha }}
+          IN_CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+          IN_REPO: com-nikatru/Nikatru_Private
           BRIDGE: https://gh-bridge.nikatru.workers.dev
+          TRUSTED: .pool-trusted
         run: |
-          set -euo pipefail
-          oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value)
-          echo "::add-mask::$oidc"
-          answer=$(curl -fsS --retry 3 -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout")
-          token=$(jq -r .token <<<"$answer")
-          [[ -n "$token" && "$token" != null ]] || { echo "::error::the bridge returned no token"; exit 1; }
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: ${{ inputs.checkout_sha }}
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Check out private main's step wrapper and composite actions
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: main
-          path: .pool-trusted
-          sparse-checkout: |
-            tooling/ci
-            .github/actions
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
+          set -uo pipefail
+          # The bridge's token can 404 a fetch until it propagates: each retry asks for a FRESH one (pool-checkout.ts POOL_MINTS_PER_ATTEMPT).
+          wait_s=(0 10 30 60)
+          url="https://github.com/$IN_REPO"
+          token=''
+          why=''
+          err="${RUNNER_TEMP:-/tmp}/pool-git.err"
+          mint() {
+            local oidc answer code
+            oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value) || { why='bridge: the OIDC token could not be minted'; return 1; }
+            [[ -n "$oidc" && "$oidc" != null ]] || { why='bridge: the OIDC answer held no token'; return 1; }
+            echo "::add-mask::$oidc"
+            answer=$(curl -sS --retry 3 -w '\n%{http_code}' -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout") || { why='bridge: POST /pool-checkout could not be reached'; return 1; }
+            code=${answer##*$'\n'}
+            answer=${answer%$'\n'*}
+            [[ "$code" == 200 ]] || { why="bridge: POST /pool-checkout answered HTTP $code ($(jq -r '.error // empty' <<<"$answer" 2>/dev/null | tr -cd '[:print:]' | head -c 160))"; return 1; }
+            token=$(jq -r '.token // empty' <<<"$answer")
+            [[ -n "$token" ]] || { why='bridge: the bridge returned no token'; return 1; }
+            echo "::add-mask::$token"
+          }
+          # The token reaches git through the environment, never argv or a config file: no credential outlives the step.
+          authed() {
+            local basic
+            basic=$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')
+            echo "::add-mask::$basic"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" git "$@" 2>"$err"
+          }
+          # A failed fetch, named by its class: git's own fetch lines say nothing of the private tree.
+          fetch_why() {
+            local e
+            e=$(grep -E '^(fatal|error|remote):' "$err" | tail -2 | tr '\n' ' ' | tr -cd '[:print:]' | head -c 200)
+            case "$e" in
+              *'not found'* | *' 404'*) why="checkout: $1 404s (Repository not found) — $e" ;;
+              *'expected'*'packfile'*) why="checkout: $1 ended before its packfile — $e" ;;
+              *promisor*) why="checkout: $1 could not reach its promisor remote — $e" ;;
+              *) why="checkout: $1 failed — $e" ;;
+            esac
+          }
+          attempt() {
+            mint || return 1
+            git init -q . && { git remote remove origin 2>/dev/null; git remote add origin "$url"; } || { why='checkout: the workspace could not be initialised'; return 1; }
+            authed fetch --no-tags --prune --no-recurse-submodules origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || { fetch_why 'the fetch of the private branches'; return 1; }
+            if ! git cat-file -e "$IN_CHECKOUT_SHA^{commit}" 2>/dev/null; then
+              authed fetch --no-tags --no-recurse-submodules origin "$IN_CHECKOUT_SHA" || { fetch_why "the fetch of checkout_sha $IN_CHECKOUT_SHA"; return 1; }
+            fi
+            git checkout -q --force --detach "$IN_CHECKOUT_SHA" 2>/dev/null || { why="checkout: checkout_sha $IN_CHECKOUT_SHA could not be checked out"; return 1; }
+            rm -rf "$TRUSTED" && git init -q "$TRUSTED" && git -C "$TRUSTED" remote add origin "$url" && git -C "$TRUSTED" sparse-checkout set tooling/ci .github/actions || { why="checkout: $TRUSTED could not be initialised"; return 1; }
+            authed -C "$TRUSTED" fetch --no-tags --depth 1 origin '+refs/heads/main:refs/remotes/origin/main' || { fetch_why "the fetch of private main into $TRUSTED"; return 1; }
+            git -C "$TRUSTED" checkout -q --force -B main refs/remotes/origin/main 2>/dev/null || { why="checkout: private main could not be checked out into $TRUSTED"; return 1; }
+          }
+          for n in "${!wait_s[@]}"; do
+            if (( n > 0 )); then
+              echo "::warning::pool checkout attempt $n of ${#wait_s[@]} failed ($why); retrying in ${wait_s[n]} s with a fresh bridge token"
+              sleep "${wait_s[n]}"
+            fi
+            if attempt; then
+              echo "pool checkout: the private code at $IN_CHECKOUT_SHA and private main's tooling, attempt $((n + 1)) of ${#wait_s[@]}"
+              exit 0
+            fi
+          done
+          echo "::error::POOL-INFRA $why (after ${#wait_s[@]} attempts, each with a fresh bridge token)"
+          exit 1
       - name: Keep private main's copies out of the checked-out tree
         run: printf '/.pool-trusted/\n' >> "$(git rev-parse --git-path info/exclude)"
       - name: Name the private commit (the shell prelude's identity, from the parent run)
@@ -3088,38 +3688,78 @@ jobs:
           jq -e --argjson want '["worker"]' 'type == "object" and ((keys | sort) == ($want | sort)) and all(.[]; type == "string" and test("^[A-Za-z0-9._-]{1,100}$") and . != "." and . != "..")' <<<"$IN_MATRIX" >/dev/null || { echo "::error::matrix is not this job's {key: value}"; exit 1; }
           jq -e --argjson want '{}' 'type == "object" and ((keys | sort) == ($want | keys | sort)) and all(to_entries[]; (.value | type == "object") and ((.value | keys | sort) == ($want[.key] | sort)) and all(.value[]; type == "string" and length <= 4096))' <<<"$IN_NEEDS" >/dev/null || { echo "::error::needs is not exactly the outputs this job reads"; exit 1; }
           jq -e 'type == "object" and ((keys - ["event","ref","base_sha","base_ref","pr"]) | length == 0) and ((.event // "") | test("^[a-z_]{0,32}$")) and ((.ref // "") | test("^(refs/(heads|tags|pull)/[A-Za-z0-9._/-]{1,200})?$")) and ((.base_sha // "") | test("^([0-9a-f]{40})?$")) and ((.base_ref // "") | test("^[A-Za-z0-9._/-]{0,200}$")) and ((.pr // "") | tostring | test("^([1-9][0-9]{0,9})?$"))' <<<"$IN_IDENTITY" >/dev/null || { echo "::error::identity is not the parent's {event, ref, base_sha, base_ref, pr}"; exit 1; }
-      - name: A read-only token for the private code (the bridge's POST /pool-checkout)
+      - name: Check out the private code with the bridge's read-only token (POST /pool-checkout), retried with a fresh one
         id: pool-checkout
+        shell: bash
         env:
           IN_SHA: ${{ inputs.sha }}
+          IN_CHECKOUT_SHA: ${{ inputs.checkout_sha }}
+          IN_REPO: com-nikatru/Nikatru_Private
           BRIDGE: https://gh-bridge.nikatru.workers.dev
+          TRUSTED: .pool-trusted
         run: |
-          set -euo pipefail
-          oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value)
-          echo "::add-mask::$oidc"
-          answer=$(curl -fsS --retry 3 -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout")
-          token=$(jq -r .token <<<"$answer")
-          [[ -n "$token" && "$token" != null ]] || { echo "::error::the bridge returned no token"; exit 1; }
-          echo "::add-mask::$token"
-          echo "token=$token" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: ${{ inputs.checkout_sha }}
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Check out private main's step wrapper and composite actions
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          repository: com-nikatru/Nikatru_Private
-          ref: main
-          path: .pool-trusted
-          sparse-checkout: |
-            tooling/ci
-            .github/actions
-          token: ${{ steps.pool-checkout.outputs.token }}
-          persist-credentials: false
+          set -uo pipefail
+          # The bridge's token can 404 a fetch until it propagates: each retry asks for a FRESH one (pool-checkout.ts POOL_MINTS_PER_ATTEMPT).
+          wait_s=(0 10 30 60)
+          url="https://github.com/$IN_REPO"
+          token=''
+          why=''
+          err="${RUNNER_TEMP:-/tmp}/pool-git.err"
+          mint() {
+            local oidc answer code
+            oidc=$(curl -fsS --retry 3 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=nikatru-gh-bridge-propose" | jq -r .value) || { why='bridge: the OIDC token could not be minted'; return 1; }
+            [[ -n "$oidc" && "$oidc" != null ]] || { why='bridge: the OIDC answer held no token'; return 1; }
+            echo "::add-mask::$oidc"
+            answer=$(curl -sS --retry 3 -w '\n%{http_code}' -X POST -H "content-type: application/json" -H "x-bridge-oidc: $oidc" --data "{\"sha\":\"$IN_SHA\"}" "$BRIDGE/pool-checkout") || { why='bridge: POST /pool-checkout could not be reached'; return 1; }
+            code=${answer##*$'\n'}
+            answer=${answer%$'\n'*}
+            [[ "$code" == 200 ]] || { why="bridge: POST /pool-checkout answered HTTP $code ($(jq -r '.error // empty' <<<"$answer" 2>/dev/null | tr -cd '[:print:]' | head -c 160))"; return 1; }
+            token=$(jq -r '.token // empty' <<<"$answer")
+            [[ -n "$token" ]] || { why='bridge: the bridge returned no token'; return 1; }
+            echo "::add-mask::$token"
+          }
+          # The token reaches git through the environment, never argv or a config file: no credential outlives the step.
+          authed() {
+            local basic
+            basic=$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')
+            echo "::add-mask::$basic"
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $basic" git "$@" 2>"$err"
+          }
+          # A failed fetch, named by its class: git's own fetch lines say nothing of the private tree.
+          fetch_why() {
+            local e
+            e=$(grep -E '^(fatal|error|remote):' "$err" | tail -2 | tr '\n' ' ' | tr -cd '[:print:]' | head -c 200)
+            case "$e" in
+              *'not found'* | *' 404'*) why="checkout: $1 404s (Repository not found) — $e" ;;
+              *'expected'*'packfile'*) why="checkout: $1 ended before its packfile — $e" ;;
+              *promisor*) why="checkout: $1 could not reach its promisor remote — $e" ;;
+              *) why="checkout: $1 failed — $e" ;;
+            esac
+          }
+          attempt() {
+            mint || return 1
+            git init -q . && { git remote remove origin 2>/dev/null; git remote add origin "$url"; } || { why='checkout: the workspace could not be initialised'; return 1; }
+            authed fetch --no-tags --prune --no-recurse-submodules origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*' || { fetch_why 'the fetch of the private branches'; return 1; }
+            if ! git cat-file -e "$IN_CHECKOUT_SHA^{commit}" 2>/dev/null; then
+              authed fetch --no-tags --no-recurse-submodules origin "$IN_CHECKOUT_SHA" || { fetch_why "the fetch of checkout_sha $IN_CHECKOUT_SHA"; return 1; }
+            fi
+            git checkout -q --force --detach "$IN_CHECKOUT_SHA" 2>/dev/null || { why="checkout: checkout_sha $IN_CHECKOUT_SHA could not be checked out"; return 1; }
+            rm -rf "$TRUSTED" && git init -q "$TRUSTED" && git -C "$TRUSTED" remote add origin "$url" && git -C "$TRUSTED" sparse-checkout set tooling/ci .github/actions || { why="checkout: $TRUSTED could not be initialised"; return 1; }
+            authed -C "$TRUSTED" fetch --no-tags --depth 1 origin '+refs/heads/main:refs/remotes/origin/main' || { fetch_why "the fetch of private main into $TRUSTED"; return 1; }
+            git -C "$TRUSTED" checkout -q --force -B main refs/remotes/origin/main 2>/dev/null || { why="checkout: private main could not be checked out into $TRUSTED"; return 1; }
+          }
+          for n in "${!wait_s[@]}"; do
+            if (( n > 0 )); then
+              echo "::warning::pool checkout attempt $n of ${#wait_s[@]} failed ($why); retrying in ${wait_s[n]} s with a fresh bridge token"
+              sleep "${wait_s[n]}"
+            fi
+            if attempt; then
+              echo "pool checkout: the private code at $IN_CHECKOUT_SHA and private main's tooling, attempt $((n + 1)) of ${#wait_s[@]}"
+              exit 0
+            fi
+          done
+          echo "::error::POOL-INFRA $why (after ${#wait_s[@]} attempts, each with a fresh bridge token)"
+          exit 1
       - name: Keep private main's copies out of the checked-out tree
         run: printf '/.pool-trusted/\n' >> "$(git rev-parse --git-path info/exclude)"
       - name: Name the private commit (the shell prelude's identity, from the parent run)
