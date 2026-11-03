@@ -1348,6 +1348,10 @@ jobs:
         shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.33 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-no-bare-wait.mjs
+      - name: Every debugPrint under lib/ prints in a debug build only
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.34 --default-shell {0}
+        if: ${{ !cancelled() }}
+        run: node tooling/ci/assert-debug-log-gated.mjs
   apps-brick--app-brick:
     # generated from lane-apps.yml job app-brick: its steps after its checkout, verbatim but for matrix.shard → inputs.shard,
     # quiet-step around every run, and no artifact step (a pool repository is public).
@@ -1524,6 +1528,7 @@ jobs:
           node tooling/sites/generate-ask.mjs
           node tooling/sites/generate-checkout-strings.mjs
           node tooling/sites/locale-landings.mjs --write
+          node tooling/sites/gen-legal-summaries.mjs
           node tooling/sites/generate-discovery.mjs
           node tooling/sites/generate-well-known.mjs
           node tooling/sites/generate-personal-site.mjs
@@ -2167,8 +2172,17 @@ jobs:
           export NIKATRU_TEST_RESULTS="${NIKATRU_TEST_RESULTS:-$RUNNER_TEMP/test-results}"
           mkdir -p "$NIKATRU_TEST_RESULTS"
           melos exec --fail-fast --dir-exists=test --flutter "$filter" -- flutter test $shard '--file-reporter=json:$NIKATRU_TEST_RESULTS/$MELOS_PACKAGE_NAME.json'
+      - name: Notifications under a DST zone (TZ=America/New_York, the DST-eve case not skipped)
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-apps.workspace-gate.15 --default-shell {0}
+        if: fromJSON(inputs.matrix).part == 'packages'
+        run: |
+          set -euo pipefail
+          export NIKATRU_TEST_RESULTS="${NIKATRU_TEST_RESULTS:-$RUNNER_TEMP/test-results}"
+          mkdir -p "$NIKATRU_TEST_RESULTS"
+          cd packages/notifications && TZ=America/New_York flutter test --run-skipped --plain-name 'daily on a DST eve' test/web_notification_service_test.dart --file-reporter "json:${NIKATRU_TEST_RESULTS:-$RUNNER_TEMP}/notifications-dst-eve.json"
+          TZ=America/New_York flutter test --file-reporter "json:${NIKATRU_TEST_RESULTS:-$RUNNER_TEMP}/notifications-new-york.json"
       - name: Web arm in a real browser (dart test -p chrome)
-        shell: node ../../.pool-trusted/tooling/ci/quiet-step.mjs --name lane-apps.workspace-gate.15 --default-shell {0}
+        shell: node ../../.pool-trusted/tooling/ci/quiet-step.mjs --name lane-apps.workspace-gate.16 --default-shell {0}
         if: fromJSON(inputs.matrix).part == 'analyze'
         working-directory: packages/core
         run: |
@@ -2445,6 +2459,9 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - uses: ./.pool-trusted/.github/actions/setup-flutter
+        with:
+          android-ndk: 'true'
       - name: Restore the Gradle caches (dependencies, wrapper, task outputs)
         id: gradle-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -2458,19 +2475,16 @@ jobs:
       - name: The home job's work starts here
         run: 'true'
       - name: Turn on Gradle's local build cache for this runner only
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-build.android-artifacts.4 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-build.android-artifacts.5 --default-shell {0}
         run: |
           mkdir -p ~/.gradle
           echo 'org.gradle.caching=true' >> ~/.gradle/gradle.properties
       - name: Turn on Gradle's cache cleanup (a run of main only, on a key miss, from the saving leg)
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-build.android-artifacts.5 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-build.android-artifacts.6 --default-shell {0}
         if: ((env.NIKATRU_REF || (fromJSON(inputs.identity).ref || 'refs/heads/main')) == 'refs/heads/main' && contains(fromJSON('["push","schedule","workflow_dispatch"]'), env.NIKATRU_EVENT_NAME || (fromJSON(inputs.identity).event)) && !env.NIKATRU_PR) && steps.gradle-cache.outputs.cache-hit != 'true' && fromJSON(inputs.matrix).app == fromJSON(fromJSON(inputs.needs)['prepare']['apps'])[0]
         run: |
           mkdir -p ~/.gradle/init.d
           cp tooling/ci/gradle-cache-cleanup.init.gradle ~/.gradle/init.d/
-      - uses: ./.pool-trusted/.github/actions/setup-flutter
-        with:
-          android-ndk: 'true'
       - name: Resolve the workspace
         shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-build.android-artifacts.7 --default-shell {0}
         run: flutter pub get --enforce-lockfile
@@ -2809,8 +2823,9 @@ jobs:
           fi
           status=0
           for project in $projects; do
-            WEB_ENGINE_PROJECT="$project" node --import "$SPAWN_CEILING" --test-timeout=600000 --test --test-reporter=spec tooling/e2e/web-engines/core-flow.spec.mjs
-            code=$?
+            # why (assert-exit-capture-under-e EC-1): bash -e ends the step on a bare failing command, so the status is read as `|| code=$?`.
+            code=0
+            WEB_ENGINE_PROJECT="$project" node --import "$SPAWN_CEILING" --test-timeout=600000 --test --test-reporter=spec tooling/e2e/web-engines/core-flow.spec.mjs || code=$?
             if [ "$code" -ne 0 ]; then
               echo "::error title=Web engines (PR)::the core flow failed in ${project} (exit ${code})"
               status=1
