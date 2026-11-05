@@ -353,65 +353,68 @@ jobs:
       - name: A local script reads a workflow through workflow-scan, or refuses when blind
         shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.7 --default-shell {0}
         run: node tooling/ci/assert-workflow-readers.mjs
-      - name: A pool account changes by data alone
+      - name: Every matrix job's fan-out is capped under its ceiling, or allow-listed with a reason (runner-budget limb F)
         shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.8 --default-shell {0}
+        run: node tooling/ci/assert-runner-budget.mjs --fanout
+      - name: A pool account changes by data alone
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.9 --default-shell {0}
         run: node tooling/ci/assert-pool-portable.mjs
       - name: Every job a pull request runs is run by the parity preflight, or exempt with its reason
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.9 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.10 --default-shell {0}
         run: node tooling/ci/assert-preflight-parity.mjs
       - name: No new test case is declared inside a loop, and the loop baseline only shrinks
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.10 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.11 --default-shell {0}
         run: node tooling/ci/assert-no-loop-cases.mjs
       - name: A new mechanism claim arrives with its test or a recorded demotion, and the claim backlog only shrinks
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.11 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.12 --default-shell {0}
         run: node tooling/ci/assert-mechanism-claims.mjs
       - name: An extension README's ungraded-fixture table says what the fixture-coverage baseline says
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.12 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.13 --default-shell {0}
         run: node tooling/ci/assert-ungraded-baseline-doc.mjs
       - name: The enforcement index is what the tree says
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.13 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.14 --default-shell {0}
         run: node tooling/ci/assert-enforcement-index.mjs
       - name: Every line of the app template is accounted for
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.14 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.15 --default-shell {0}
         run: node tooling/ci/assert-chassis-ledger.mjs
       - name: Guards refuse an empty subject
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.15 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.16 --default-shell {0}
         run: node tooling/ci/assert-guards-refuse-empty.mjs
       - name: No dead tracked files
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.16 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.17 --default-shell {0}
         run: node tooling/scripts/assert-no-dead-files.mjs
       - name: Every tracked path is placed in the lane map, and every lane glob matches a file
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.17 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.18 --default-shell {0}
         run: node tooling/ci/lane-detect.mjs --check
       - name: Main's newest merge carries its Rows line in the squash message
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.18 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.19 --default-shell {0}
         if: ((fromJSON(inputs.identity).event) == 'push' || (fromJSON(inputs.identity).event) == 'workflow_dispatch') && (fromJSON(inputs.identity).ref || 'refs/heads/main') == 'refs/heads/main'
         run: node tooling/ci/assert-main-rows.mjs --ref "$GITHUB_SHA"
       - name: The CI docs match the workflows (gen-ci-map --check)
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.19 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.20 --default-shell {0}
         run: node tooling/ci/gen-ci-map.mjs --check
       - name: The release runbook's arming lines match the register (channel-arming --check)
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.20 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.21 --default-shell {0}
         run: node tooling/ci/channel-arming.mjs --check
       - name: The release runbook's §3 matches what a Release carries (gen-release-carries --check)
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.21 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.22 --default-shell {0}
         run: node tooling/ci/gen-release-carries.mjs --check
       - name: The public shell is what the generator writes, and lets no outsider in (assert-public-shell)
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.22 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.23 --default-shell {0}
         run: node tooling/ci/assert-public-shell.mjs
       - name: No shell workflow starts on an event that skips every job it has (assert-no-skipped-starts)
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.23 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.24 --default-shell {0}
         run: node tooling/ci/assert-no-skipped-starts.mjs
       - name: Every source script reaches the public shell intact, read by a real YAML parser (shell-script-parity)
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.24 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.25 --default-shell {0}
         run: python3 -I tooling/ci/shell-script-parity.py .
       - name: Guard headers cite code pinned to a commit, never by a bare line number
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.25 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.26 --default-shell {0}
         env:
           GUARD_HEADER_CITATIONS_BASE: ${{ fromJSON(inputs.identity).base_ref && format('origin/{0}', fromJSON(inputs.identity).base_ref) || '' }}
         run: node tooling/ci/assert-guard-header-citations.mjs
       - name: Every changed path is mapped to a check, or declared ungraded (affected-guards --list)
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.26 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.27 --default-shell {0}
         if: ${{ !cancelled() }}
         env:
           AFFECTED_BASE: ${{ fromJSON(inputs.identity).base_ref && format('origin/{0}', fromJSON(inputs.identity).base_ref) || '' }}
