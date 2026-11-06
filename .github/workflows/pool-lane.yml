@@ -338,12 +338,14 @@ jobs:
         shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.4 --default-shell {0}
         run: |
           set -euo pipefail
-          if ! git diff --quiet -- tooling/ci/test/coverage-manifest.json; then
-            echo "::error title=coverage-manifest.json was not regenerated::assert-guard-coverage.mjs rewrote the ratchet during this run, so the committed file is stale. Run \`node tooling/ci/assert-guard-coverage.mjs\` locally and commit the result. A manifest lower than the tree LOWERS the floor at merge, and nothing after that can see the step down."
-            git --no-pager diff -- tooling/ci/test/coverage-manifest.json
+          drift="$(git status --porcelain -- tooling/ci/test/coverage/ tooling/ci/test/coverage-manifest.json)"
+          if [ -n "$drift" ]; then
+            echo "::error title=the coverage ratchet was not regenerated::assert-guard-coverage.mjs rewrote the ratchet during this run, so the committed shards in tooling/ci/test/coverage/ are stale or missing. Run \`node tooling/ci/assert-guard-coverage.mjs\` locally and commit the result (git add tooling/ci/test/coverage/). A ratchet lower than the tree LOWERS the floor at merge, and nothing after that can see the step down."
+            echo "$drift"
+            git --no-pager diff -- tooling/ci/test/coverage/ tooling/ci/test/coverage-manifest.json
             exit 1
           fi
-          echo "ok  coverage-manifest.json is byte-identical to what this run derived"
+          echo "ok  the coverage ratchet (tooling/ci/test/coverage/) is byte-identical to what this run derived"
       - name: Every ratchet moved the safe way against its base, or carries a dated lowering
         shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guard-meta.5 --default-shell {0}
         run: node tooling/ci/assert-ratchet-base.mjs
@@ -1239,120 +1241,128 @@ jobs:
         shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.5 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-no-seam-forks.mjs
-      - name: Every shared package the template delegates to is adopted by every app
+      - name: A provider packages/app_state defines is defined there only (the twins left are a shrinking ledger)
         shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.6 --default-shell {0}
+        if: ${{ !cancelled() }}
+        run: node tooling/ci/assert-app-state-adoption.mjs
+      - name: Every shared package the template delegates to is adopted by every app
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.7 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-chassis-parity.mjs --require-history
       - name: Shared code carries no app-specific vocabulary
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.7 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.8 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-no-clone-tells.mjs
       - name: Core stays pure, the design system stays domain-free, apps use the seams
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.8 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.9 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-package-boundaries.mjs
       - name: Every package is earned, or dated
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.9 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.10 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-package-earned.mjs
       - name: Every vendor satisfies the portability checklist
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.10 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.11 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-vendor-portability.mjs
       - name: Every port earns the level it claims, and every vendor is placed
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.11 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.12 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-ports.mjs
       - name: Every secret a Worker reads is a row of tooling/worker-secrets.json
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.12 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.13 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-worker-secrets-declared.mjs
+      - name: The dispatch token is promised only what one token can read
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.14 --default-shell {0}
+        if: ${{ !cancelled() }}
+        run: node tooling/ci/assert-dispatch-pat-scope.mjs
       - name: Every structured alert a Worker writes is a row of tooling/monitor-register.json logAlerts
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.13 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.15 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-log-alerts.mjs
       - name: One convention set reaches every app, and can fail a build
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.14 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.16 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-lint-inheritance.mjs
       - name: No app has hollowed out the gates it inherited
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.15 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.17 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-no-gate-weakening.mjs
       - name: No hardcoded user-facing strings in the brick
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.16 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.18 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-no-hardcoded-strings.mjs
       - name: Every surface that names the languages reads the one locale register
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.17 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.19 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-locale-register.mjs
       - name: No shipped screen hard-wires left and right (RTL readiness)
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.18 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.20 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-rtl-directional.mjs
       - name: Every translation keeps English's placeholders and ICU shape
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.19 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.21 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/i18n/translation-qa.mjs --all
       - name: The stop-a-charge copy never claims we cancel or names a debit time
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.20 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.22 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-stop-copy.mjs
       - name: Every adapter declares where it works
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.21 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.23 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-adapter-capabilities.mjs
       - name: The inherited screen set is declared, present and reachable
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.22 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.24 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-screen-set.mjs
       - name: Every native target registers the app's auth callback, and every link-sending call passes its redirect
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.23 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.25 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-auth-callbacks.mjs
       - name: Every reachable surface has a width measurement, and every measurement a surface
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.24 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.26 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-responsive-coverage.mjs
       - name: Every reachable surface has an accessibility sweep, and every sweep a surface
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.25 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.27 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-a11y-coverage.mjs
       - name: Every tap target takes the keyboard, every password field autofills, every web app has a screen-reader tree
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.26 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.28 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-a11y-primitives.mjs
       - name: A first-run gate is found by its CONTROL, never by its widget type
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.27 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.29 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-modal-detection.mjs
       - name: Every rollout read is an observed rollout
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.28 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.30 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-flag-exposure.mjs
       - name: Every app carries a done-record, and its DoD items really run
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.29 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.31 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-app-dod.mjs
       - name: The DoD keyboard row states the route counts the keyboard tests assert
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.30 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.32 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-dod-keyboard-row.mjs
       - name: Every mutation proof still addresses the code it was run against
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.31 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.33 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-mutation-proofs.mjs
       - name: No branch carries a done-record the pre-push --refresh would rewrite
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.32 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.34 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-mutation-proofs.mjs --refresh --check
       - name: A pressed control names its stage, and no failure is swallowed without a reason
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.33 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.35 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-no-bare-wait.mjs
       - name: Every debugPrint under lib/ prints in a debug build only
-        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.34 --default-shell {0}
+        shell: node .pool-trusted/tooling/ci/quiet-step.mjs --name lane-guards.guards-chassis.36 --default-shell {0}
         if: ${{ !cancelled() }}
         run: node tooling/ci/assert-debug-log-gated.mjs
   apps-brick--app-brick:
@@ -1530,6 +1540,7 @@ jobs:
           node tooling/release-notes/render.mjs
           node tooling/sites/generate-ask.mjs
           node tooling/sites/generate-checkout-strings.mjs
+          node tooling/sites/generate-site-identity.mjs
           node tooling/sites/locale-landings.mjs --write
           node tooling/sites/gen-legal-summaries.mjs
           node tooling/sites/generate-discovery.mjs
@@ -2154,7 +2165,7 @@ jobs:
         env:
           PART: ${{ fromJSON(inputs.matrix).part }}
           MEMBERS_GLOB: 'nikatru_*'
-          APPS_SHARDS: '3'
+          APPS_SHARDS: '6'
         run: |
           set -euo pipefail
           export PATH="$PATH:$HOME/.pub-cache/bin"
