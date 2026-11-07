@@ -203,7 +203,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "${{ runner.temp }}/guard-tests"
-          node tooling/ci/guard-test-shards.mjs --plan --shards 4 --shard ${{ inputs.shard }} --out "${{ runner.temp }}/guard-tests/files.txt" > /dev/null
+          node tooling/ci/guard-test-shards.mjs --plan --shards 6 --shard ${{ inputs.shard }} --out "${{ runner.temp }}/guard-tests/files.txt" > /dev/null
           node --import "$SPAWN_CEILING" --test-timeout=600000 --test --test-reporter=spec  --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination="${{ runner.temp }}/guard-tests/guard-tests.junit.xml" $(cat "${{ runner.temp }}/guard-tests/files.txt")
   guard-singles--guard-meta:
     # generated from lane-guards.yml job guard-meta: its steps after its checkout, verbatim but for matrix.shard → inputs.shard,
